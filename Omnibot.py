@@ -1015,6 +1015,11 @@ class MacroMakerApp:
         self.command_canvas.bind("<Control-v>", self.paste_command)
         self.command_canvas.bind("<Delete>", lambda e: self.remove_command())
         
+        # Also bind to root window for global shortcuts
+        self.root.bind("<Control-c>", self.copy_command)
+        self.root.bind("<Control-x>", self.cut_command)
+        self.root.bind("<Control-v>", self.paste_command)
+        
         # Command buttons
         btn_frame = ttk.Frame(middle_frame)
         btn_frame.pack(fill=tk.X)
@@ -1023,6 +1028,7 @@ class MacroMakerApp:
         ttk.Button(btn_frame, text="Add Key Hold", command=self.add_key_hold).pack(side=tk.LEFT, padx=2)
         ttk.Button(btn_frame, text="Add Key Release", command=self.add_key_release).pack(side=tk.LEFT, padx=2)
         ttk.Button(btn_frame, text="Add Mouse Click", command=self.add_mouse_click).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_frame, text="Add Mouse Click (Absolute)", command=self.add_mouse_click_absolute).pack(side=tk.LEFT, padx=2)
         ttk.Button(btn_frame, text="Add Mouse Move", command=self.add_mouse_move).pack(side=tk.LEFT, padx=2)
         
         btn_frame2 = ttk.Frame(middle_frame)
@@ -1068,13 +1074,37 @@ class MacroMakerApp:
         if not self.current_macro:
             return
         
+        # Calculate nesting level for each command
+        nesting_levels = []
+        current_level = 0
+        in_else = False
+        
+        for cmd in self.current_macro.commands:
+            if isinstance(cmd, (IfImageCommand, RepeatCommand)):
+                nesting_levels.append(current_level)
+                current_level += 1
+                in_else = False
+            elif isinstance(cmd, ElseStatementCommand):
+                # ELSE is at same level as IF
+                nesting_levels.append(current_level - 1)
+                in_else = True
+            elif isinstance(cmd, (EndIfStatementCommand, EndRepeatCommand)):
+                current_level = max(0, current_level - 1)
+                nesting_levels.append(current_level)
+                in_else = False
+            else:
+                nesting_levels.append(current_level)
+        
         # Create a frame for each command
         for idx, cmd in enumerate(self.current_macro.commands):
             # Determine background color based on selection
             bg_color = "lightblue" if idx == self.selected_index else "white"
             
+            # Calculate indentation based on nesting level
+            indent = nesting_levels[idx] * 20  # 20 pixels per nesting level
+            
             cmd_frame = tk.Frame(self.command_frame, relief=tk.RAISED, borderwidth=1, bg=bg_color)
-            cmd_frame.pack(fill=tk.X, padx=2, pady=2)
+            cmd_frame.pack(fill=tk.X, padx=(2 + indent, 2), pady=2)
             cmd_frame._command_index = idx
             
             # Check if this is an image command
@@ -1503,6 +1533,7 @@ class MacroMakerApp:
         # Mouse commands submenu
         mouse_menu = tk.Menu(menu, tearoff=0)
         mouse_menu.add_command(label="Click", underline=0, command=lambda: self.insert_command_at_selection("mouse_click"))
+        mouse_menu.add_command(label="Click (Absolute)", underline=7, command=lambda: self.insert_command_at_selection("mouse_click_absolute"))
         mouse_menu.add_command(label="Move", underline=0, command=lambda: self.insert_command_at_selection("mouse_move"))
         menu.add_cascade(label="Mouse Commands", underline=0, menu=mouse_menu)
         
@@ -1584,13 +1615,37 @@ class MacroMakerApp:
                                 return
                         else:
                             return
-                    else:  # absolute
-                        x, y = self.get_mouse_position()
-                        if x is not None:
-                            self.current_macro.commands.insert(insert_index, MouseClickCommand(button, x, y, mode="absolute"))
-                        else:
-                            return
                 else:
+                    return
+        
+        elif command_type == "mouse_click_absolute":
+            button = simpledialog.askstring("Mouse Click (Absolute)", "Enter button (left/right/middle):", initialvalue="left")
+            if button:
+                messagebox.showinfo(
+                    "Capture Position", 
+                    "Move your mouse to the desired click location and press F2 to capture the coordinates."
+                )
+                
+                captured_pos = {"x": None, "y": None}
+                
+                def on_f2_press(event):
+                    if event.name == 'f2':
+                        captured_pos["x"], captured_pos["y"] = pyautogui.position()
+                        keyboard.unhook_all()
+                
+                keyboard.on_press(on_f2_press)
+                
+                timeout = 30
+                start_time = time.time()
+                while captured_pos["x"] is None and (time.time() - start_time) < timeout:
+                    time.sleep(0.1)
+                
+                keyboard.unhook_all()
+                
+                if captured_pos["x"] is not None:
+                    self.current_macro.commands.insert(insert_index, MouseClickCommand(button, captured_pos["x"], captured_pos["y"], mode="absolute"))
+                else:
+                    messagebox.showwarning("Timeout", "Position capture timed out. No command was added.")
                     return
         
         elif command_type == "mouse_move":
@@ -2235,7 +2290,7 @@ class MacroMakerApp:
         return None
     
     def show_click_mode_dialog(self):
-        """Show dialog to choose click mode: in place, offset, or absolute position"""
+        """Show dialog to choose click mode: in place or offset"""
         dialog = tk.Toplevel(self.root)
         dialog.title("Click Mode")
         dialog.transient(self.root)
@@ -2254,11 +2309,6 @@ class MacroMakerApp:
             dialog.destroy()
             return "break"
         
-        def choose_absolute(event=None):
-            result["mode"] = "absolute"
-            dialog.destroy()
-            return "break"
-        
         btn_frame = tk.Frame(dialog)
         btn_frame.pack(pady=10)
         
@@ -2268,16 +2318,11 @@ class MacroMakerApp:
         offset_btn = tk.Button(btn_frame, text="Offset", command=choose_offset, width=12)
         offset_btn.pack(side=tk.LEFT, padx=5)
         
-        # Add Absolute Position button
-        absolute_btn = tk.Button(dialog, text="Absolute Position", command=choose_absolute, width=15)
-        absolute_btn.pack(pady=5)
-        
         # Bind keyboard shortcuts
         dialog.bind("<Return>", choose_in_place)  # Enter selects In Place (default)
         dialog.bind("<space>", choose_in_place)   # Space selects In Place (default)
         dialog.bind("1", choose_in_place)
         dialog.bind("2", choose_offset)
-        dialog.bind("3", choose_absolute)
         dialog.bind('<Escape>', lambda e: dialog.destroy())
         
         # Now that all widgets are packed, center the dialog
@@ -2326,24 +2371,37 @@ class MacroMakerApp:
     
     def get_mouse_position(self):
         """Capture mouse position"""
-        messagebox.showinfo("Mouse Position", "Move your mouse to the desired position and click")
-        
-        position = {"x": 0, "y": 0, "captured": False}
+        position = {"x": None, "y": None, "captured": False}
+        listener_ref = {"listener": None}
         
         def on_click(x, y, button, pressed):
             if pressed:
                 position["x"] = x
                 position["y"] = y
                 position["captured"] = True
+                # Stop the listener
+                if listener_ref["listener"]:
+                    listener_ref["listener"].stop()
                 return False  # Stop listener
         
-        with pynput_mouse.Listener(on_click=on_click) as listener:
-            listener.join()
+        # Show message BEFORE starting listener
+        result = messagebox.showinfo("Capture Mouse Position", 
+                                      "Click OK, then click where you want the mouse action to occur.\n\n"
+                                      "The next click will be captured.")
         
-        return position["x"], position["y"] if position["captured"] else (None, None)
+        if result:
+            # Wait a moment for user to move away from OK button
+            time.sleep(0.5)
+            
+            # Start listener
+            listener_ref["listener"] = pynput_mouse.Listener(on_click=on_click)
+            listener_ref["listener"].start()
+            listener_ref["listener"].join()  # Wait for click
+        
+        return (position["x"], position["y"]) if position["captured"] else (None, None)
     
     def add_mouse_click(self):
-        """Add mouse click command"""
+        """Add mouse click command (in place or offset)"""
         if not self.current_macro:
             messagebox.showwarning("Warning", "Please select a macro first")
             return
@@ -2366,15 +2424,51 @@ class MacroMakerApp:
                             return
                     else:
                         return
-                else:  # absolute
-                    x, y = self.get_mouse_position()
-                    if x is not None:
-                        self.current_macro.add_command(MouseClickCommand(button, x, y, mode="absolute"))
-                    else:
-                        return
                 self.selected_index = len(self.current_macro.commands) - 1
                 self.update_command_list()
                 self.save_macros()
+    
+    def add_mouse_click_absolute(self):
+        """Add mouse click at absolute position using F2 to capture"""
+        if not self.current_macro:
+            messagebox.showwarning("Warning", "Please select a macro first")
+            return
+        
+        button = simpledialog.askstring("Mouse Click (Absolute)", "Enter button (left/right/middle):", initialvalue="left")
+        if button:
+            # Show instructions
+            messagebox.showinfo(
+                "Capture Position", 
+                "Move your mouse to the desired click location and press F2 to capture the coordinates."
+            )
+            
+            # Set up F2 capture
+            captured_pos = {"x": None, "y": None}
+            
+            def on_f2_press(event):
+                if event.name == 'f2':
+                    captured_pos["x"], captured_pos["y"] = pyautogui.position()
+                    keyboard.unhook_all()
+            
+            keyboard.on_press(on_f2_press)
+            
+            # Wait for F2 press (with timeout)
+            timeout = 30  # 30 seconds
+            start_time = time.time()
+            while captured_pos["x"] is None and (time.time() - start_time) < timeout:
+                time.sleep(0.1)
+                self.root.update()  # Keep UI responsive
+            
+            keyboard.unhook_all()
+            
+            if captured_pos["x"] is not None:
+                self.save_state()
+                self.current_macro.add_command(MouseClickCommand(button, captured_pos["x"], captured_pos["y"], mode="absolute"))
+                self.selected_index = len(self.current_macro.commands) - 1
+                self.update_command_list()
+                self.save_macros()
+            else:
+                messagebox.showwarning("Timeout", "Position capture timed out. No command was added.")
     
     def add_mouse_move(self):
         """Add mouse move command"""
