@@ -994,6 +994,10 @@ class MacroMakerApp:
         self.command_frame.bind("<Configure>", lambda e: self.command_canvas.configure(scrollregion=self.command_canvas.bbox("all")))
         self.command_canvas.bind("<MouseWheel>", self._on_mousewheel)
         
+        # Bind right-click to canvas and frame for context menu
+        self.command_canvas.bind("<Button-3>", self.show_context_menu)
+        self.command_frame.bind("<Button-3>", self.show_context_menu)
+        
         # Bind undo/redo shortcuts
         self.root.bind("<Control-z>", lambda e: self.undo())
         self.root.bind("<Control-Z>", lambda e: self.redo())  # Ctrl+Shift+Z
@@ -1019,6 +1023,7 @@ class MacroMakerApp:
         self.root.bind("<Control-c>", self.copy_command)
         self.root.bind("<Control-x>", self.cut_command)
         self.root.bind("<Control-v>", self.paste_command)
+        self.root.bind("<Delete>", lambda e: self.remove_command())
         
         # Command buttons
         btn_frame = ttk.Frame(middle_frame)
@@ -1489,25 +1494,30 @@ class MacroMakerApp:
     
     def show_context_menu_keyboard(self, event):
         """Show context menu via keyboard (Shift+F10)"""
-        if not self.current_macro or self.selected_index is None:
+        if not self.current_macro:
             return
         
-        # Find the selected frame to get its position
-        for child in self.command_frame.winfo_children():
-            if hasattr(child, '_command_index') and child._command_index == self.selected_index:
-                # Calculate screen position for menu
-                frame_x = child.winfo_rootx()
-                frame_y = child.winfo_rooty() + child.winfo_height() // 2
-                
-                # Create a mock event with the position
-                class MockEvent:
-                    def __init__(self, x, y):
-                        self.x_root = x
-                        self.y_root = y
-                        self.widget = child
-                
-                self.show_context_menu(MockEvent(frame_x, frame_y))
-                break
+        # Create a mock event with the position
+        class MockEvent:
+            def __init__(self, x, y, widget):
+                self.x_root = x
+                self.y_root = y
+                self.widget = widget
+        
+        # If there's a selected frame, position menu at that frame
+        if self.selected_index is not None:
+            for child in self.command_frame.winfo_children():
+                if hasattr(child, '_command_index') and child._command_index == self.selected_index:
+                    # Calculate screen position for menu
+                    frame_x = child.winfo_rootx()
+                    frame_y = child.winfo_rooty() + child.winfo_height() // 2
+                    self.show_context_menu(MockEvent(frame_x, frame_y, child))
+                    break
+        else:
+            # No selection - show menu at canvas position
+            canvas_x = self.command_canvas.winfo_rootx() + 20
+            canvas_y = self.command_canvas.winfo_rooty() + 20
+            self.show_context_menu(MockEvent(canvas_x, canvas_y, self.command_canvas))
         
         return "break"
     
@@ -1595,151 +1605,30 @@ class MacroMakerApp:
         # Calculate insert position
         insert_index = (self.selected_index + 1) if self.selected_index is not None else len(self.current_macro.commands)
         
-        self.save_state()
+        # Delegate to appropriate add_ method with insert_index
+        command_map = {
+            "mouse_click": self.add_mouse_click,
+            "mouse_click_absolute": self.add_mouse_click_absolute,
+            "mouse_move": self.add_mouse_move,
+            "key_press": self.add_key_press,
+            "key_hold": self.add_key_hold,
+            "key_release": self.add_key_release,
+            "if_statement": self.add_if,
+            "else": self.add_else,
+            "end_if": self.add_endif,
+            "repeat": self.add_repeat,
+            "end_repeat": self.add_end_repeat,
+            "delay": self.add_delay,
+            "delay_ms": self.add_delay_ms,
+        }
         
-        # Handle different command types
-        if command_type == "mouse_click":
-            button = simpledialog.askstring("Mouse Click", "Enter button (left/right/middle):", initialvalue="left")
-            if button:
-                mode_result = self.show_click_mode_dialog()
-                if mode_result:
-                    if mode_result == "in_place":
-                        self.current_macro.commands.insert(insert_index, MouseClickCommand(button, 0, 0, mode="in_place"))
-                    elif mode_result == "offset":
-                        offset_x = simpledialog.askinteger("X Offset", "Enter X offset (pixels, can be negative):", initialvalue=0)
-                        if offset_x is not None:
-                            offset_y = simpledialog.askinteger("Y Offset", "Enter Y offset (pixels, can be negative):", initialvalue=0)
-                            if offset_y is not None:
-                                self.current_macro.commands.insert(insert_index, MouseClickCommand(button, 0, 0, mode="offset", offset_x=offset_x, offset_y=offset_y))
-                            else:
-                                return
-                        else:
-                            return
-                else:
-                    return
-        
-        elif command_type == "mouse_click_absolute":
-            button = simpledialog.askstring("Mouse Click (Absolute)", "Enter button (left/right/middle):", initialvalue="left")
-            if button:
-                messagebox.showinfo(
-                    "Capture Position", 
-                    "Move your mouse to the desired click location and press F2 to capture the coordinates."
-                )
-                
-                captured_pos = {"x": None, "y": None}
-                
-                def on_f2_press(event):
-                    if event.name == 'f2':
-                        captured_pos["x"], captured_pos["y"] = pyautogui.position()
-                        keyboard.unhook_all()
-                
-                keyboard.on_press(on_f2_press)
-                
-                timeout = 30
-                start_time = time.time()
-                while captured_pos["x"] is None and (time.time() - start_time) < timeout:
-                    time.sleep(0.1)
-                
-                keyboard.unhook_all()
-                
-                if captured_pos["x"] is not None:
-                    self.current_macro.commands.insert(insert_index, MouseClickCommand(button, captured_pos["x"], captured_pos["y"], mode="absolute"))
-                else:
-                    messagebox.showwarning("Timeout", "Position capture timed out. No command was added.")
-                    return
-        
-        elif command_type == "mouse_move":
-            x, y = self.get_mouse_position()
-            if x is not None:
-                self.current_macro.commands.insert(insert_index, MouseMoveCommand(x, y))
-        
-        elif command_type == "key_press":
-            key = self.show_key_selector("Key Press")
-            if key:
-                self.current_macro.commands.insert(insert_index, KeyPressCommand(key))
-        
-        elif command_type == "key_hold":
-            key = self.show_key_selector("Key Hold")
-            if key:
-                self.current_macro.commands.insert(insert_index, KeyHoldCommand(key))
-        
-        elif command_type == "key_release":
-            key = self.show_key_selector("Key Release")
-            if key:
-                self.current_macro.commands.insert(insert_index, KeyReleaseCommand(key))
-        
-        elif command_type == "if_image":
+        # Special handlers for commands with custom logic
+        if command_type == "if_image":
             self.add_if_image_at_index(insert_index)
-            return  # Method handles update internally
-        
         elif command_type == "find_image":
             self.add_find_image_at_index(insert_index)
-            return  # Method handles update internally
-        
-        elif command_type == "clipboard_clear":
-            self.current_macro.commands.insert(insert_index, ClipboardClearCommand())
-        
-        elif command_type == "clipboard_set":
-            value = simpledialog.askstring("Set Clipboard", "Enter value to set clipboard to:")
-            if value is not None:
-                self.current_macro.commands.insert(insert_index, ClipboardSetCommand(value))
-        
-        elif command_type == "clipboard_increment":
-            self.current_macro.commands.insert(insert_index, ClipboardIncrementCommand())
-        
-        elif command_type == "clipboard_copy":
-            self.current_macro.commands.insert(insert_index, ClipboardCopyCommand())
-        
-        elif command_type == "clipboard_paste":
-            self.current_macro.commands.insert(insert_index, ClipboardPasteCommand())
-        
-        elif command_type == "delay":
-            seconds = simpledialog.askfloat("Delay", "Enter delay in seconds:")
-            if seconds is not None:
-                self.current_macro.commands.insert(insert_index, DelayCommand(seconds))
-        
-        elif command_type == "delay_ms":
-            milliseconds = simpledialog.askinteger("Delay (ms)", "Enter delay in milliseconds:")
-            if milliseconds is not None:
-                self.current_macro.commands.insert(insert_index, DelayMsCommand(milliseconds))
-        
-        elif command_type == "wait_for_window":
-            pattern = simpledialog.askstring("Wait For Window", "Enter window title pattern (use * as wildcard):")
-            if pattern:
-                timeout = simpledialog.askinteger("Timeout", "Enter timeout in seconds:", initialvalue=30)
-                if timeout is not None:
-                    self.current_macro.commands.insert(insert_index, WaitForWindowCommand(pattern, timeout))
-        
-        elif command_type == "message":
-            text = simpledialog.askstring("Message", "Enter message text:")
-            if text:
-                always_on_top = messagebox.askyesno("Always On Top", "Should the message window be always on top?")
-                always_focused = messagebox.askyesno("Always Focused", "Should the message window remain focused?")
-                self.current_macro.commands.insert(insert_index, MessageCommand(text, always_on_top, always_focused))
-        
-        elif command_type == "if_statement":
-            condition = simpledialog.askstring("IF Statement", "Enter condition (e.g., clipboard == 'value'):")
-            if condition:
-                self.current_macro.commands.insert(insert_index, IfStatementCommand(condition))
-        
-        elif command_type == "else":
-            self.current_macro.commands.insert(insert_index, ElseStatementCommand())
-        
-        elif command_type == "end_if":
-            self.current_macro.commands.insert(insert_index, EndIfStatementCommand())
-        
-        elif command_type == "repeat":
-            count = simpledialog.askinteger("REPEAT", "Enter number of repetitions:")
-            if count is not None:
-                self.current_macro.commands.insert(insert_index, RepeatCommand(count))
-        
-        elif command_type == "end_repeat":
-            self.current_macro.commands.insert(insert_index, EndRepeatCommand())
-        
-        # Select the newly inserted command
-        self.selected_index = insert_index
-        self.update_command_list()
-        self.save_macros()
+        elif command_type in command_map:
+            command_map[command_type](insert_index)
     
     def on_drag_start(self, event):
         """Start dragging a command"""
@@ -2191,7 +2080,7 @@ class MacroMakerApp:
         dialog.wait_window()
         return result['key']
     
-    def add_key_press(self):
+    def add_key_press(self, insert_index=None):
         """Add key press command"""
         if not self.current_macro:
             messagebox.showwarning("Warning", "Please select a macro first")
@@ -2200,12 +2089,16 @@ class MacroMakerApp:
         key = self.show_key_selector("Key Press")
         if key:
             self.save_state()
-            self.current_macro.add_command(KeyPressCommand(key))
-            self.selected_index = len(self.current_macro.commands) - 1
+            if insert_index is not None:
+                self.current_macro.commands.insert(insert_index, KeyPressCommand(key))
+                self.selected_index = insert_index
+            else:
+                self.current_macro.add_command(KeyPressCommand(key))
+                self.selected_index = len(self.current_macro.commands) - 1
             self.update_command_list()
             self.save_macros()
     
-    def add_key_hold(self):
+    def add_key_hold(self, insert_index=None):
         """Add key hold command"""
         if not self.current_macro:
             messagebox.showwarning("Warning", "Please select a macro first")
@@ -2214,12 +2107,16 @@ class MacroMakerApp:
         key = self.show_key_selector("Key Hold")
         if key:
             self.save_state()
-            self.current_macro.add_command(KeyHoldCommand(key))
-            self.selected_index = len(self.current_macro.commands) - 1
+            if insert_index is not None:
+                self.current_macro.commands.insert(insert_index, KeyHoldCommand(key))
+                self.selected_index = insert_index
+            else:
+                self.current_macro.add_command(KeyHoldCommand(key))
+                self.selected_index = len(self.current_macro.commands) - 1
             self.update_command_list()
             self.save_macros()
     
-    def add_key_release(self):
+    def add_key_release(self, insert_index=None):
         """Add key release command"""
         if not self.current_macro:
             messagebox.showwarning("Warning", "Please select a macro first")
@@ -2228,8 +2125,12 @@ class MacroMakerApp:
         key = self.show_key_selector("Key Release")
         if key:
             self.save_state()
-            self.current_macro.add_command(KeyReleaseCommand(key))
-            self.selected_index = len(self.current_macro.commands) - 1
+            if insert_index is not None:
+                self.current_macro.commands.insert(insert_index, KeyReleaseCommand(key))
+                self.selected_index = insert_index
+            else:
+                self.current_macro.add_command(KeyReleaseCommand(key))
+                self.selected_index = len(self.current_macro.commands) - 1
             self.update_command_list()
             self.save_macros()
     
@@ -2400,7 +2301,7 @@ class MacroMakerApp:
         
         return (position["x"], position["y"]) if position["captured"] else (None, None)
     
-    def add_mouse_click(self):
+    def add_mouse_click(self, insert_index=None):
         """Add mouse click command (in place or offset)"""
         if not self.current_macro:
             messagebox.showwarning("Warning", "Please select a macro first")
@@ -2412,23 +2313,31 @@ class MacroMakerApp:
             mode_result = self.show_click_mode_dialog()
             if mode_result:
                 self.save_state()
+                cmd = None
                 if mode_result == "in_place":
-                    self.current_macro.add_command(MouseClickCommand(button, 0, 0, mode="in_place"))
+                    cmd = MouseClickCommand(button, 0, 0, mode="in_place")
                 elif mode_result == "offset":
                     offset_x = simpledialog.askinteger("X Offset", "Enter X offset (pixels, can be negative):", initialvalue=0)
                     if offset_x is not None:
                         offset_y = simpledialog.askinteger("Y Offset", "Enter Y offset (pixels, can be negative):", initialvalue=0)
                         if offset_y is not None:
-                            self.current_macro.add_command(MouseClickCommand(button, 0, 0, mode="offset", offset_x=offset_x, offset_y=offset_y))
+                            cmd = MouseClickCommand(button, 0, 0, mode="offset", offset_x=offset_x, offset_y=offset_y)
                         else:
                             return
                     else:
                         return
-                self.selected_index = len(self.current_macro.commands) - 1
-                self.update_command_list()
-                self.save_macros()
+                
+                if cmd:
+                    if insert_index is not None:
+                        self.current_macro.commands.insert(insert_index, cmd)
+                        self.selected_index = insert_index
+                    else:
+                        self.current_macro.add_command(cmd)
+                        self.selected_index = len(self.current_macro.commands) - 1
+                    self.update_command_list()
+                    self.save_macros()
     
-    def add_mouse_click_absolute(self):
+    def add_mouse_click_absolute(self, insert_index=None):
         """Add mouse click at absolute position using F2 to capture"""
         if not self.current_macro:
             messagebox.showwarning("Warning", "Please select a macro first")
@@ -2463,14 +2372,19 @@ class MacroMakerApp:
             
             if captured_pos["x"] is not None:
                 self.save_state()
-                self.current_macro.add_command(MouseClickCommand(button, captured_pos["x"], captured_pos["y"], mode="absolute"))
-                self.selected_index = len(self.current_macro.commands) - 1
+                cmd = MouseClickCommand(button, captured_pos["x"], captured_pos["y"], mode="absolute")
+                if insert_index is not None:
+                    self.current_macro.commands.insert(insert_index, cmd)
+                    self.selected_index = insert_index
+                else:
+                    self.current_macro.add_command(cmd)
+                    self.selected_index = len(self.current_macro.commands) - 1
                 self.update_command_list()
                 self.save_macros()
             else:
                 messagebox.showwarning("Timeout", "Position capture timed out. No command was added.")
     
-    def add_mouse_move(self):
+    def add_mouse_move(self, insert_index=None):
         """Add mouse move command"""
         if not self.current_macro:
             messagebox.showwarning("Warning", "Please select a macro first")
@@ -2479,46 +2393,66 @@ class MacroMakerApp:
         x, y = self.get_mouse_position()
         if x is not None:
             self.save_state()
-            self.current_macro.add_command(MouseMoveCommand(x, y))
-            self.selected_index = len(self.current_macro.commands) - 1
+            cmd = MouseMoveCommand(x, y)
+            if insert_index is not None:
+                self.current_macro.commands.insert(insert_index, cmd)
+                self.selected_index = insert_index
+            else:
+                self.current_macro.add_command(cmd)
+                self.selected_index = len(self.current_macro.commands) - 1
             self.update_command_list()
             self.save_macros()
     
-    def add_if(self):
+    def add_if(self, insert_index=None):
         """Add IF statement"""
         if not self.current_macro:
             messagebox.showwarning("Warning", "Please select a macro first")
             return
         
-        condition = simpledialog.askstring("IF Statement", "Enter condition (e.g., True, False):")
-        if condition is not None:
+        condition = simpledialog.askstring("IF Statement", "Enter condition (e.g., clipboard == 'value'):")
+        if condition:
             self.save_state()
-            self.current_macro.add_command(IfStatementCommand(condition))
-            self.selected_index = len(self.current_macro.commands) - 1
+            cmd = IfStatementCommand(condition)
+            if insert_index is not None:
+                self.current_macro.commands.insert(insert_index, cmd)
+                self.selected_index = insert_index
+            else:
+                self.current_macro.add_command(cmd)
+                self.selected_index = len(self.current_macro.commands) - 1
             self.update_command_list()
             self.save_macros()
     
-    def add_else(self):
+    def add_else(self, insert_index=None):
         """Add ELSE statement"""
         if not self.current_macro:
             messagebox.showwarning("Warning", "Please select a macro first")
             return
         
         self.save_state()
-        self.current_macro.add_command(ElseStatementCommand())
-        self.selected_index = len(self.current_macro.commands) - 1
+        cmd = ElseStatementCommand()
+        if insert_index is not None:
+            self.current_macro.commands.insert(insert_index, cmd)
+            self.selected_index = insert_index
+        else:
+            self.current_macro.add_command(cmd)
+            self.selected_index = len(self.current_macro.commands) - 1
         self.update_command_list()
         self.save_macros()
     
-    def add_endif(self):
+    def add_endif(self, insert_index=None):
         """Add ENDIF statement"""
         if not self.current_macro:
             messagebox.showwarning("Warning", "Please select a macro first")
             return
         
         self.save_state()
-        self.current_macro.add_command(EndIfStatementCommand())
-        self.selected_index = len(self.current_macro.commands) - 1
+        cmd = EndIfStatementCommand()
+        if insert_index is not None:
+            self.current_macro.commands.insert(insert_index, cmd)
+            self.selected_index = insert_index
+        else:
+            self.current_macro.add_command(cmd)
+            self.selected_index = len(self.current_macro.commands) - 1
         self.update_command_list()
         self.save_macros()
     
@@ -2825,33 +2759,43 @@ class MacroMakerApp:
         dialog.after(50, recenter)
         dialog.after(250, focus_text)
     
-    def add_repeat(self):
+    def add_repeat(self, insert_index=None):
         """Add REPEAT command"""
         if not self.current_macro:
             messagebox.showwarning("Warning", "Please select a macro first")
             return
         
-        count = simpledialog.askinteger("Repeat", "Enter repeat count:")
+        count = simpledialog.askinteger("REPEAT", "Enter number of repetitions:")
         if count is not None:
             self.save_state()
-            self.current_macro.add_command(RepeatCommand(count))
-            self.selected_index = len(self.current_macro.commands) - 1
+            cmd = RepeatCommand(count)
+            if insert_index is not None:
+                self.current_macro.commands.insert(insert_index, cmd)
+                self.selected_index = insert_index
+            else:
+                self.current_macro.add_command(cmd)
+                self.selected_index = len(self.current_macro.commands) - 1
             self.update_command_list()
             self.save_macros()
     
-    def add_end_repeat(self):
+    def add_end_repeat(self, insert_index=None):
         """Add END REPEAT command"""
         if not self.current_macro:
             messagebox.showwarning("Warning", "Please select a macro first")
             return
         
         self.save_state()
-        self.current_macro.add_command(EndRepeatCommand())
-        self.selected_index = len(self.current_macro.commands) - 1
+        cmd = EndRepeatCommand()
+        if insert_index is not None:
+            self.current_macro.commands.insert(insert_index, cmd)
+            self.selected_index = insert_index
+        else:
+            self.current_macro.add_command(cmd)
+            self.selected_index = len(self.current_macro.commands) - 1
         self.update_command_list()
         self.save_macros()
     
-    def add_delay(self):
+    def add_delay(self, insert_index=None):
         """Add delay command"""
         if not self.current_macro:
             messagebox.showwarning("Warning", "Please select a macro first")
@@ -2860,12 +2804,17 @@ class MacroMakerApp:
         seconds = simpledialog.askfloat("Delay", "Enter delay in seconds:")
         if seconds is not None:
             self.save_state()
-            self.current_macro.add_command(DelayCommand(seconds))
-            self.selected_index = len(self.current_macro.commands) - 1
+            cmd = DelayCommand(seconds)
+            if insert_index is not None:
+                self.current_macro.commands.insert(insert_index, cmd)
+                self.selected_index = insert_index
+            else:
+                self.current_macro.add_command(cmd)
+                self.selected_index = len(self.current_macro.commands) - 1
             self.update_command_list()
             self.save_macros()
     
-    def add_delay_ms(self):
+    def add_delay_ms(self, insert_index=None):
         """Add delay (milliseconds) command"""
         if not self.current_macro:
             messagebox.showwarning("Warning", "Please select a macro first")
@@ -2874,8 +2823,13 @@ class MacroMakerApp:
         milliseconds = simpledialog.askinteger("Delay (ms)", "Enter delay in milliseconds:")
         if milliseconds is not None:
             self.save_state()
-            self.current_macro.add_command(DelayMsCommand(milliseconds))
-            self.selected_index = len(self.current_macro.commands) - 1
+            cmd = DelayMsCommand(milliseconds)
+            if insert_index is not None:
+                self.current_macro.commands.insert(insert_index, cmd)
+                self.selected_index = insert_index
+            else:
+                self.current_macro.add_command(cmd)
+                self.selected_index = len(self.current_macro.commands) - 1
             self.update_command_list()
             self.save_macros()
     
