@@ -1010,6 +1010,11 @@ class MacroMakerApp:
         self.command_canvas.bind("<Down>", self.navigate_down)
         self.command_canvas.bind("<Home>", self.navigate_home)
         self.command_canvas.bind("<End>", self.navigate_end)
+        # Bind Ctrl+Arrow/Home/End for moving commands
+        self.command_canvas.bind("<Control-Up>", self.move_selected_up)
+        self.command_canvas.bind("<Control-Down>", self.move_selected_down)
+        self.command_canvas.bind("<Control-Home>", self.move_selected_to_start)
+        self.command_canvas.bind("<Control-End>", self.move_selected_to_end)
         self.command_canvas.bind("<Prior>", self.navigate_page_up)  # Page Up
         self.command_canvas.bind("<Next>", self.navigate_page_down)  # Page Down
         self.command_canvas.bind("<Shift-F10>", self.show_context_menu_keyboard)
@@ -1314,6 +1319,11 @@ class MacroMakerApp:
         # Update selection
         self.selected_index = cmd_index
         self.update_command_list()
+        # Focus the command list panel (same as pressing F2)
+        try:
+            self.command_canvas.focus_set()
+        except:
+            pass
         
         # Initialize drag data
         self.drag_data["index"] = cmd_index
@@ -1430,6 +1440,66 @@ class MacroMakerApp:
         self.selected_index = len(self.current_macro.commands) - 1
         self.update_command_list()
         self.scroll_to_selected()
+        return "break"
+
+    def move_selected_up(self, event):
+        """Move the selected command up by one"""
+        if not self.current_macro or self.selected_index is None:
+            return "break"
+        if self.selected_index > 0:
+            self.save_state()
+            idx = self.selected_index
+            self.current_macro.commands[idx-1], self.current_macro.commands[idx] = (
+                self.current_macro.commands[idx], self.current_macro.commands[idx-1]
+            )
+            self.selected_index = idx - 1
+            self.update_command_list()
+            self.save_macros()
+            self.scroll_to_selected()
+        return "break"
+
+    def move_selected_down(self, event):
+        """Move the selected command down by one"""
+        if not self.current_macro or self.selected_index is None:
+            return "break"
+        if self.selected_index < len(self.current_macro.commands) - 1:
+            self.save_state()
+            idx = self.selected_index
+            self.current_macro.commands[idx+1], self.current_macro.commands[idx] = (
+                self.current_macro.commands[idx], self.current_macro.commands[idx+1]
+            )
+            self.selected_index = idx + 1
+            self.update_command_list()
+            self.save_macros()
+            self.scroll_to_selected()
+        return "break"
+
+    def move_selected_to_start(self, event):
+        """Move the selected command to the start of the macro"""
+        if not self.current_macro or self.selected_index is None:
+            return "break"
+        if self.selected_index > 0:
+            self.save_state()
+            cmd = self.current_macro.commands.pop(self.selected_index)
+            self.current_macro.commands.insert(0, cmd)
+            self.selected_index = 0
+            self.update_command_list()
+            self.save_macros()
+            self.scroll_to_selected()
+        return "break"
+
+    def move_selected_to_end(self, event):
+        """Move the selected command to the end of the macro"""
+        if not self.current_macro or self.selected_index is None:
+            return "break"
+        if self.selected_index < len(self.current_macro.commands) - 1:
+            self.save_state()
+            cmd = self.current_macro.commands.pop(self.selected_index)
+            self.current_macro.commands.append(cmd)
+            self.selected_index = len(self.current_macro.commands) - 1
+            self.update_command_list()
+            self.save_macros()
+            self.scroll_to_selected()
         return "break"
     
     def navigate_page_up(self, event):
@@ -2415,10 +2485,14 @@ class MacroMakerApp:
             cmd = IfStatementCommand(condition)
             if insert_index is not None:
                 self.current_macro.commands.insert(insert_index, cmd)
+                # Auto-insert ENDIF right after IF
+                self.current_macro.commands.insert(insert_index + 1, EndIfStatementCommand())
                 self.selected_index = insert_index
             else:
                 self.current_macro.add_command(cmd)
-                self.selected_index = len(self.current_macro.commands) - 1
+                # Auto-insert ENDIF right after IF
+                self.current_macro.commands.insert(len(self.current_macro.commands), EndIfStatementCommand())
+                self.selected_index = len(self.current_macro.commands) - 2
             self.update_command_list()
             self.save_macros()
     
@@ -2432,10 +2506,14 @@ class MacroMakerApp:
         cmd = ElseStatementCommand()
         if insert_index is not None:
             self.current_macro.commands.insert(insert_index, cmd)
+            # Auto-insert ENDIF right after ELSE
+            self.current_macro.commands.insert(insert_index + 1, EndIfStatementCommand())
             self.selected_index = insert_index
         else:
             self.current_macro.add_command(cmd)
-            self.selected_index = len(self.current_macro.commands) - 1
+            # Auto-insert ENDIF right after ELSE
+            self.current_macro.commands.insert(len(self.current_macro.commands), EndIfStatementCommand())
+            self.selected_index = len(self.current_macro.commands) - 2
         self.update_command_list()
         self.save_macros()
     
@@ -2505,7 +2583,10 @@ class MacroMakerApp:
             def save_options():
                 self.save_state()
                 self.current_macro.add_command(IfImageCommand(image_path, conf_var.get(), move_var.get()))
-                self.selected_index = len(self.current_macro.commands) - 1
+                # Auto-insert ENDIF right after IF IMAGE
+                self.current_macro.commands.insert(len(self.current_macro.commands), EndIfStatementCommand())
+                # Select IF IMAGE (not ENDIF)
+                self.selected_index = len(self.current_macro.commands) - 2
                 self.update_command_list()
                 self.save_macros()
                 dialog.destroy()
@@ -2587,6 +2668,8 @@ class MacroMakerApp:
             
             def save_options():
                 self.current_macro.commands.insert(insert_index, IfImageCommand(image_path, conf_var.get(), move_var.get()))
+                # Auto-insert ENDIF right after IF IMAGE
+                self.current_macro.commands.insert(insert_index + 1, EndIfStatementCommand())
                 self.update_command_list()
                 self.save_macros()
                 dialog.destroy()
