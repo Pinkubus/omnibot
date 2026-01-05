@@ -17,6 +17,435 @@ from ctypes import wintypes
 # Disable pyautogui failsafe
 pyautogui.FAILSAFE = False
 
+# Debug mode for image matching - set to True to save debug artifacts
+DEBUG_IMAGE = False
+DEBUG_IMAGE_DIR = "debug_images"
+
+# ============================================================================
+# DPI AWARENESS (Windows) - Call early to fix coordinate mismatches
+# ============================================================================
+def set_dpi_awareness():
+    """Make the process DPI-aware on Windows to fix coordinate mismatches."""
+    try:
+        # Try per-monitor DPI awareness (Windows 8.1+)
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        print("[DPI] Set per-monitor DPI awareness (level 2)")
+    except AttributeError:
+        try:
+            # Fallback to basic DPI awareness (Windows Vista+)
+            ctypes.windll.user32.SetProcessDPIAware()
+            print("[DPI] Set basic DPI awareness")
+        except Exception as e:
+            print(f"[DPI] Could not set DPI awareness: {e}")
+    except Exception as e:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+            print("[DPI] Fallback: Set basic DPI awareness")
+        except Exception as e2:
+            print(f"[DPI] Could not set DPI awareness: {e}, {e2}")
+
+# Call DPI awareness at module load time
+set_dpi_awareness()
+
+# ============================================================================
+# IMAGE MATCHING HELPER FUNCTIONS
+# ============================================================================
+
+def get_dpi_scale_factor():
+    """Detect DPI scale factor by comparing pyautogui screen size vs actual grab size."""
+    try:
+        pag_size = pyautogui.size()
+        # Grab a small region and check actual pixel dimensions
+        grab = ImageGrab.grab(bbox=(0, 0, 100, 100))
+        grab_size = grab.size
+        sx = grab_size[0] / 100.0
+        sy = grab_size[1] / 100.0
+        if abs(sx - 1.0) > 0.01 or abs(sy - 1.0) > 0.01:
+            print(f"[DPI] Detected scale factor: sx={sx:.2f}, sy={sy:.2f}")
+        return sx, sy
+    except Exception as e:
+        print(f"[DPI] Could not detect scale factor: {e}")
+        return 1.0, 1.0
+
+def normalize_region(region):
+    """
+    Normalize region to (left, top, width, height) format for pyautogui.
+    
+    Input can be:
+    - (x1, y1, x2, y2) bbox format -> convert to (left, top, width, height)
+    - (left, top, width, height) -> pass through
+    - list or tuple
+    - None -> return None
+    
+    Returns tuple of ints or None.
+    """
+    if region is None:
+        return None
+    
+    # Coerce to list of ints
+    try:
+        region = [int(r) for r in region]
+    except (TypeError, ValueError):
+        print(f"[Region] Invalid region format: {region}")
+        return None
+    
+    if len(region) != 4:
+        print(f"[Region] Region must have 4 elements: {region}")
+        return None
+    
+    x1, y1, x2_or_w, y2_or_h = region
+    
+    # Detect if this is bbox format (x2 > x1 and y2 > y1 with both > reasonable threshold)
+    # If x2_or_w and y2_or_h are both larger than x1, y1 respectively and > 100, likely bbox
+    if x2_or_w > x1 and y2_or_h > y1 and x2_or_w > 100 and y2_or_h > 100:
+        # Looks like bbox (x1, y1, x2, y2) -> convert to (left, top, width, height)
+        width = x2_or_w - x1
+        height = y2_or_h - y1
+        result = (x1, y1, width, height)
+        if DEBUG_IMAGE:
+            print(f"[Region] Converted bbox {region} -> ltwh {result}")
+        return result
+    else:
+        # Assume already (left, top, width, height)
+        return tuple(region)
+
+def load_template(path):
+    """
+    Load template image and return (numpy array in BGR, width, height).
+    Returns (None, 0, 0) on failure.
+    """
+    try:
+        img = cv2.imread(path, cv2.IMREAD_COLOR)
+        if img is None:
+            print(f"[Template] Failed to load: {path}")
+            return None, 0, 0
+        h, w = img.shape[:2]
+        return img, w, h
+    except Exception as e:
+        print(f"[Template] Error loading {path}: {e}")
+        return None, 0, 0
+
+def screenshot_region(left, top, width, height):
+    """
+    Capture a screenshot of the specified region.
+    Returns numpy array in BGR format, or None on failure.
+    """
+    try:
+        # Ensure integer coordinates
+        left, top, width, height = int(left), int(top), int(width), int(height)
+        
+        # Clamp to valid values
+        if width <= 0 or height <= 0:
+            print(f"[Screenshot] Invalid dimensions: {width}x{height}")
+            return None
+        
+        # Use PIL ImageGrab
+        bbox = (left, top, left + width, top + height)
+        grab = ImageGrab.grab(bbox=bbox)
+        
+        # Convert to numpy BGR
+        img = np.array(grab)
+        img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        return img
+    except Exception as e:
+        print(f"[Screenshot] Error capturing region ({left},{top},{width},{height}): {e}")
+        return None
+
+def similarity_score(patch, template):
+    """
+    Compute similarity between patch and template using normalized cross-correlation.
+    Both must be same size numpy arrays in BGR format.
+    Returns float in range [0, 1] where 1 is perfect match.
+    """
+    if patch is None or template is None:
+        return 0.0
+    
+    try:
+        # Ensure same size
+        if patch.shape != template.shape:
+            # Resize patch to template size
+            patch = cv2.resize(patch, (template.shape[1], template.shape[0]))
+        
+        # Convert to grayscale for comparison
+        patch_gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
+        template_gray = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
+        
+        # Use template matching with normalized cross-correlation
+        # Since they're same size, we get a single value
+        result = cv2.matchTemplate(patch_gray, template_gray, cv2.TM_CCOEFF_NORMED)
+        score = float(result[0, 0])
+        
+        # Normalize to 0-1 range (TM_CCOEFF_NORMED can be -1 to 1)
+        score = (score + 1.0) / 2.0
+        return score
+    except Exception as e:
+        print(f"[Similarity] Error computing similarity: {e}")
+        return 0.0
+
+def save_debug_artifacts(template_path, template_img, patch_img, cx, cy, location, score, attempt):
+    """Save debug images to disk for analysis."""
+    try:
+        os.makedirs(DEBUG_IMAGE_DIR, exist_ok=True)
+        timestamp = int(time.time() * 1000)
+        base_name = Path(template_path).stem
+        
+        # Save template
+        if template_img is not None:
+            cv2.imwrite(f"{DEBUG_IMAGE_DIR}/{timestamp}_{base_name}_template.png", template_img)
+        
+        # Save patch under cursor
+        if patch_img is not None:
+            cv2.imwrite(f"{DEBUG_IMAGE_DIR}/{timestamp}_{base_name}_patch_attempt{attempt}.png", patch_img)
+        
+        # Save annotated screenshot of region around match
+        try:
+            # Capture area around the match
+            grab_left = max(0, cx - 200)
+            grab_top = max(0, cy - 200)
+            context_img = screenshot_region(grab_left, grab_top, 400, 400)
+            if context_img is not None:
+                # Draw rectangle where we think match is
+                rel_cx = cx - grab_left
+                rel_cy = cy - grab_top
+                if template_img is not None:
+                    th, tw = template_img.shape[:2]
+                    pt1 = (int(rel_cx - tw/2), int(rel_cy - th/2))
+                    pt2 = (int(rel_cx + tw/2), int(rel_cy + th/2))
+                    cv2.rectangle(context_img, pt1, pt2, (0, 255, 0), 2)
+                # Draw crosshair at center
+                cv2.drawMarker(context_img, (int(rel_cx), int(rel_cy)), (0, 0, 255), 
+                              cv2.MARKER_CROSS, 20, 2)
+                cv2.imwrite(f"{DEBUG_IMAGE_DIR}/{timestamp}_{base_name}_context_attempt{attempt}.png", context_img)
+        except Exception as e:
+            print(f"[Debug] Error saving context image: {e}")
+        
+        # Log info
+        print(f"[Debug] Saved artifacts to {DEBUG_IMAGE_DIR}/ (attempt {attempt}, score={score:.3f})")
+    except Exception as e:
+        print(f"[Debug] Error saving debug artifacts: {e}")
+
+def verify_cursor_over_template(cx, cy, template_path, tolerance=0.7):
+    """
+    Verify that the cursor is positioned over the template image.
+    
+    Args:
+        cx, cy: Expected center position
+        template_path: Path to template image
+        tolerance: Minimum similarity score to consider a match (0-1)
+    
+    Returns:
+        (verified: bool, score: float, patch: numpy array or None)
+    """
+    template, tw, th = load_template(template_path)
+    if template is None:
+        print(f"[Verify] Could not load template: {template_path}")
+        return False, 0.0, None
+    
+    # Calculate region under cursor that corresponds to template bbox
+    left = int(cx - tw / 2)
+    top = int(cy - th / 2)
+    
+    # Capture the patch
+    patch = screenshot_region(left, top, tw, th)
+    if patch is None:
+        print(f"[Verify] Could not capture patch at ({left},{top},{tw},{th})")
+        return False, 0.0, None
+    
+    # Compute similarity
+    score = similarity_score(patch, template)
+    verified = score >= tolerance
+    
+    if DEBUG_IMAGE:
+        print(f"[Verify] Template: {tw}x{th}, Center: ({cx},{cy}), Score: {score:.3f}, Verified: {verified}")
+    
+    return verified, score, patch
+
+def find_image_cv2(template_path, confidence, search_region=None):
+    """
+    Alternative image finding using cv2.matchTemplate directly.
+    More reliable than pyautogui.locateOnScreen in some cases.
+    
+    Returns (found: bool, cx: int, cy: int, match_rect: tuple) or (False, 0, 0, None)
+    """
+    template, tw, th = load_template(template_path)
+    if template is None:
+        return False, 0, 0, None
+    
+    try:
+        # Capture search region or full screen
+        if search_region:
+            region = normalize_region(search_region)
+            if region:
+                screenshot = screenshot_region(*region)
+                offset_x, offset_y = region[0], region[1]
+            else:
+                screenshot = np.array(ImageGrab.grab())
+                screenshot = cv2.cvtColor(screenshot, cv2.COLOR_RGB2BGR)
+                offset_x, offset_y = 0, 0
+        else:
+            screenshot = np.array(ImageGrab.grab())
+            screenshot = cv2.cvtColor(screenshot, cv2.COLOR_RGB2BGR)
+            offset_x, offset_y = 0, 0
+        
+        if screenshot is None:
+            return False, 0, 0, None
+        
+        # Run template matching
+        result = cv2.matchTemplate(screenshot, template, cv2.TM_CCOEFF_NORMED)
+        min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
+        
+        # Check if match is good enough
+        # Convert confidence to TM_CCOEFF_NORMED threshold (it returns -1 to 1)
+        threshold = confidence * 2 - 1  # Map 0.5-1.0 to 0-1 in CCOEFF space
+        threshold = max(0.3, confidence - 0.2)  # More lenient threshold
+        
+        if max_val >= threshold:
+            # Found match
+            match_left = max_loc[0] + offset_x
+            match_top = max_loc[1] + offset_y
+            cx = match_left + tw // 2
+            cy = match_top + th // 2
+            match_rect = (match_left, match_top, tw, th)
+            
+            if DEBUG_IMAGE:
+                print(f"[CV2] Match found: score={max_val:.3f}, center=({cx},{cy})")
+            
+            return True, cx, cy, match_rect
+        else:
+            if DEBUG_IMAGE:
+                print(f"[CV2] No match: best score={max_val:.3f} < threshold={threshold:.3f}")
+            return False, 0, 0, None
+            
+    except Exception as e:
+        print(f"[CV2] Error in template matching: {e}")
+        return False, 0, 0, None
+
+def find_image_with_verification(image_path, confidence, move_to_image, search_region=None, 
+                                  max_attempts=5, verify_tolerance=0.6):
+    """
+    Find image with verification and retry logic.
+    
+    Args:
+        image_path: Path to template image
+        confidence: Confidence threshold for initial match
+        move_to_image: Whether to move cursor to the found location
+        search_region: Optional (x1,y1,x2,y2) or (left,top,w,h) region to search
+        max_attempts: Maximum retry attempts
+        verify_tolerance: Minimum similarity for verification
+    
+    Returns:
+        (found: bool, final_center: tuple or None)
+    """
+    template, tw, th = load_template(image_path)
+    if template is None:
+        print(f"[Find] Could not load template: {image_path}")
+        return False, None
+    
+    # Normalize region once
+    region = normalize_region(search_region)
+    
+    # Log diagnostics
+    if DEBUG_IMAGE:
+        print(f"[Find] Template: {image_path} ({tw}x{th})")
+        print(f"[Find] Confidence: {confidence}, Move: {move_to_image}, Region: {region}")
+        sx, sy = get_dpi_scale_factor()
+        print(f"[Find] DPI scale: ({sx:.2f}, {sy:.2f})")
+    
+    best_score = 0.0
+    best_center = None
+    
+    for attempt in range(1, max_attempts + 1):
+        if DEBUG_IMAGE:
+            print(f"[Find] Attempt {attempt}/{max_attempts}")
+        
+        # Try pyautogui first
+        try:
+            if region:
+                location = pyautogui.locateOnScreen(image_path, confidence=confidence, region=region)
+            else:
+                location = pyautogui.locateOnScreen(image_path, confidence=confidence)
+        except Exception as e:
+            print(f"[Find] pyautogui error: {e}")
+            location = None
+        
+        # If pyautogui failed, try cv2 method
+        if location is None:
+            found, cx, cy, match_rect = find_image_cv2(image_path, confidence, search_region)
+            if found:
+                location = match_rect  # Use as pseudo-location
+            else:
+                if DEBUG_IMAGE:
+                    print(f"[Find] No candidate found on attempt {attempt}")
+                continue
+        else:
+            cx, cy = pyautogui.center(location)
+            cx, cy = int(cx), int(cy)
+        
+        if DEBUG_IMAGE:
+            print(f"[Find] Candidate center: ({cx}, {cy})")
+            print(f"[Find] Location box: {location}")
+        
+        # Move cursor if requested
+        if move_to_image:
+            pyautogui.moveTo(cx, cy)
+            time.sleep(0.05)  # Small delay for cursor to settle
+            
+            # Get actual cursor position
+            actual_x, actual_y = pyautogui.position()
+            if DEBUG_IMAGE:
+                print(f"[Find] Cursor after moveTo: ({actual_x}, {actual_y})")
+                if abs(actual_x - cx) > 2 or abs(actual_y - cy) > 2:
+                    print(f"[Find] WARNING: Cursor drift detected! Expected ({cx},{cy}), got ({actual_x},{actual_y})")
+        
+        # Verify the match
+        verified, score, patch = verify_cursor_over_template(cx, cy, image_path, verify_tolerance)
+        
+        if DEBUG_IMAGE:
+            save_debug_artifacts(image_path, template, patch, cx, cy, location, score, attempt)
+        
+        if score > best_score:
+            best_score = score
+            best_center = (cx, cy)
+        
+        if verified:
+            print(f"[Find] SUCCESS: Verified match at ({cx},{cy}) with score {score:.3f}")
+            return True, (cx, cy)
+        else:
+            print(f"[Find] Verification failed: score={score:.3f} < tolerance={verify_tolerance}")
+            
+            # Try local refinement if we have a candidate
+            if score > 0.3 and attempt < max_attempts:
+                # Search in neighborhood around current position
+                refined_found, ref_cx, ref_cy, _ = find_image_cv2(
+                    image_path, confidence * 0.9, 
+                    search_region=(cx - 100, cy - 100, cx + 100, cy + 100)
+                )
+                if refined_found:
+                    if DEBUG_IMAGE:
+                        print(f"[Find] Refinement found better position: ({ref_cx}, {ref_cy})")
+                    cx, cy = ref_cx, ref_cy
+                    
+                    if move_to_image:
+                        pyautogui.moveTo(cx, cy)
+                        time.sleep(0.05)
+                    
+                    verified2, score2, patch2 = verify_cursor_over_template(cx, cy, image_path, verify_tolerance)
+                    if verified2:
+                        print(f"[Find] SUCCESS after refinement: ({cx},{cy}) score={score2:.3f}")
+                        return True, (cx, cy)
+    
+    # Exhausted attempts
+    print(f"[Find] FAILED after {max_attempts} attempts. Best score: {best_score:.3f} at {best_center}")
+    
+    # If we got close, return best position anyway (for backwards compatibility)
+    if best_score > verify_tolerance * 0.8 and best_center:
+        print(f"[Find] Returning best candidate despite not fully verified")
+        if move_to_image:
+            pyautogui.moveTo(best_center[0], best_center[1])
+        return True, best_center
+    
+    return False, None
+
 
 class MacroCommand:
     """Base class for all macro commands"""
@@ -329,25 +758,48 @@ class IfImageCommand(MacroCommand):
     
     def execute(self, context):
         # Returns True/False for if statement
-        return self.find_image()
+        result = self.find_image(context)
+        return result
     
-    def find_image(self):
+    def find_image(self, context=None):
+        """
+        Find any of the configured images on screen.
+        Uses verification to ensure cursor lands on correct spot.
+        """
+        if context is None:
+            context = {}
+        
         # Try to find any of the images
         for img_info in self.image_paths:
             try:
-                if self.search_region:
-                    # Search within the specified region
-                    location = pyautogui.locateOnScreen(img_info["path"], confidence=img_info["confidence"], region=self.search_region)
-                else:
-                    # Search entire screen
-                    location = pyautogui.locateOnScreen(img_info["path"], confidence=img_info["confidence"])
-                if location:
-                    if self.move_to_image:
-                        x, y = pyautogui.center(location)
-                        pyautogui.moveTo(x, y)
+                image_path = img_info["path"]
+                confidence = img_info.get("confidence", self.confidence)
+                
+                # Use the new verified find function
+                found, center = find_image_with_verification(
+                    image_path=image_path,
+                    confidence=confidence,
+                    move_to_image=self.move_to_image,
+                    search_region=self.search_region,
+                    max_attempts=5,
+                    verify_tolerance=0.55  # Slightly lower tolerance for flexibility
+                )
+                
+                if found:
+                    # Store match info in context for debugging
+                    context["last_image_match"] = {
+                        "template_path": image_path,
+                        "center": center,
+                        "confidence": confidence,
+                        "move_to_image": self.move_to_image
+                    }
                     return True
+                    
             except Exception as e:
-                print(f"Error finding image {img_info['path']}: {e}")
+                print(f"[IfImage] Error finding image {img_info.get('path', 'unknown')}: {e}")
+                import traceback
+                traceback.print_exc()
+        
         return False
     
     def to_dict(self):
@@ -381,20 +833,33 @@ class FindImageCommand(MacroCommand):
         self.search_region = search_region  # (x1, y1, x2, y2) or None for full screen
     
     def execute(self, context):
+        """
+        Find image and move cursor to it with verification.
+        """
         try:
-            if self.search_region:
-                # Search within the specified region
-                location = pyautogui.locateOnScreen(self.image_path, confidence=self.confidence, region=self.search_region)
-            else:
-                # Search entire screen
-                location = pyautogui.locateOnScreen(self.image_path, confidence=self.confidence)
-            if location:
-                x, y = pyautogui.center(location)
-                pyautogui.moveTo(x, y)
-                return True
-            return False
+            # Use the new verified find function
+            found, center = find_image_with_verification(
+                image_path=self.image_path,
+                confidence=self.confidence,
+                move_to_image=True,  # FindImageCommand always moves
+                search_region=self.search_region,
+                max_attempts=5,
+                verify_tolerance=0.55
+            )
+            
+            if found and context is not None:
+                context["last_image_match"] = {
+                    "template_path": self.image_path,
+                    "center": center,
+                    "confidence": self.confidence
+                }
+            
+            return found
+            
         except Exception as e:
-            print(f"Error finding image: {e}")
+            print(f"[FindImage] Error finding image: {e}")
+            import traceback
+            traceback.print_exc()
             return False
     
     def to_dict(self):
