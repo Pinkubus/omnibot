@@ -813,7 +813,7 @@ class MacroExecutor:
         self.running = False
         self.stop_flag = False
     
-    def execute(self, macro, repeat_count=1):
+    def execute(self, macro, repeat_count=1, progress_callback=None):
         """Execute a macro with repeat support"""
         self.running = True
         self.stop_flag = False
@@ -821,22 +821,26 @@ class MacroExecutor:
         if repeat_count == 0:
             # Infinite loop
             while not self.stop_flag:
-                self._run_commands(macro.commands)
+                self._run_commands(macro.commands, progress_callback, 0)
         else:
             for _ in range(repeat_count):
                 if self.stop_flag:
                     break
-                self._run_commands(macro.commands)
+                self._run_commands(macro.commands, progress_callback, 0)
         
         self.running = False
     
-    def _run_commands(self, commands):
+    def _run_commands(self, commands, progress_callback=None, base_index=0):
         """Run a list of commands with control flow support"""
         context = {}
         i = 0
         
         while i < len(commands) and not self.stop_flag:
             cmd = commands[i]
+            
+            # Call progress callback with global index
+            if progress_callback:
+                progress_callback(base_index + i)
             
             if isinstance(cmd, IfStatementCommand):
                 # Simple boolean condition evaluation
@@ -865,7 +869,7 @@ class MacroExecutor:
                     for _ in range(cmd.count):
                         if self.stop_flag:
                             break
-                        self._run_commands(repeat_commands)
+                        self._run_commands(repeat_commands, progress_callback, base_index + i + 1)
                     i = end_repeat_idx
             
             elif not isinstance(cmd, (EndIfStatementCommand, EndRepeatCommand)):
@@ -1150,6 +1154,34 @@ class MacroMakerApp:
         # Update scroll region
         self.command_frame.update_idletasks()
         self.command_canvas.configure(scrollregion=self.command_canvas.bbox("all"))
+    
+    def highlight_command(self, index):
+        """Highlight the command at the given index during execution"""
+        # Reset all frames to default color
+        for frame in self.command_frame.winfo_children():
+            if hasattr(frame, '_command_index'):
+                frame.config(bg="white")
+                for child in frame.winfo_children():
+                    child.config(bg="white")
+        
+        # Highlight the current command if index is valid
+        if index >= 0 and 0 <= index < len(self.command_frame.winfo_children()):
+            frames = self.command_frame.winfo_children()
+            for frame in frames:
+                if hasattr(frame, '_command_index') and frame._command_index == index:
+                    frame.config(bg="dodgerblue")
+                    for child in frame.winfo_children():
+                        child.config(bg="dodgerblue")
+                    # Scroll to make the highlighted command visible
+                    self.command_canvas.update_idletasks()
+                    y = frame.winfo_y()
+                    canvas_bbox = self.command_canvas.bbox("all")
+                    if canvas_bbox:
+                        total_height = canvas_bbox[3]
+                        if total_height > 0:
+                            fraction = y / total_height
+                            self.command_canvas.yview_moveto(fraction)
+                    break
     
     def _on_mousewheel(self, event):
         """Handle mousewheel scrolling"""
@@ -3033,8 +3065,12 @@ class MacroMakerApp:
         
         self.status_label.config(text="Running...")
         
+        def progress_callback(index):
+            self.root.after(0, lambda: self.highlight_command(index))
+        
         def run():
-            self.executor.execute(self.current_macro, repeat_count)
+            self.executor.execute(self.current_macro, repeat_count, progress_callback)
+            self.root.after(0, lambda: self.highlight_command(-1))  # Reset highlight
             self.status_label.config(text="Ready")
         
         threading.Thread(target=run, daemon=True).start()
@@ -3043,6 +3079,7 @@ class MacroMakerApp:
         """Stop the running macro"""
         if self.executor.running:
             self.executor.stop()
+            self.highlight_command(-1)  # Reset highlight
             self.status_label.config(text="Stopped")
     
     def save_macros(self):
