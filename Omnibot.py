@@ -41,6 +41,8 @@ class MacroCommand:
             return KeyHoldCommand(data.get("key"))
         elif cmd_type == "key_release":
             return KeyReleaseCommand(data.get("key"))
+        elif cmd_type == "keyboard_sequence":
+            return KeyboardSequenceCommand(data.get("sequence", []))
         elif cmd_type == "mouse_click":
             return MouseClickCommand(
                 data.get("button"), 
@@ -67,10 +69,11 @@ class MacroCommand:
                 data.get("image_path"),
                 data.get("confidence", 0.8),
                 data.get("move_to_image", False),
-                data.get("image_paths", None)
+                data.get("image_paths", None),
+                data.get("search_region", None)
             )
         elif cmd_type == "find_image":
-            return FindImageCommand(data.get("image_path"), data.get("confidence", 0.8))
+            return FindImageCommand(data.get("image_path"), data.get("confidence", 0.8), data.get("search_region", None))
         elif cmd_type == "repeat":
             return RepeatCommand(data.get("count", 1))
         elif cmd_type == "end_repeat":
@@ -87,6 +90,20 @@ class MacroCommand:
                 data.get("always_on_top", False),
                 data.get("always_focused", False)
             )
+        elif cmd_type == "sound":
+            cmd = SoundCommand(data.get("sound_type", "beep"))
+            cmd.custom_sound = data.get("custom_sound")
+            return cmd
+        elif cmd_type == "clipboard_clear":
+            return ClipboardClearCommand()
+        elif cmd_type == "clipboard_set":
+            return ClipboardSetCommand(data.get("value", ""))
+        elif cmd_type == "clipboard_increment":
+            return ClipboardIncrementCommand()
+        elif cmd_type == "clipboard_copy":
+            return ClipboardCopyCommand()
+        elif cmd_type == "clipboard_paste":
+            return ClipboardPasteCommand()
         return None
     
     def __str__(self):
@@ -136,6 +153,30 @@ class KeyReleaseCommand(MacroCommand):
     
     def __str__(self):
         return f"KEY RELEASE: {self.key}"
+
+
+class KeyboardSequenceCommand(MacroCommand):
+    def __init__(self, sequence=None):
+        super().__init__("keyboard_sequence")
+        self.sequence = sequence or []  # List of (key, action) tuples
+    
+    def execute(self, context):
+        for key, action in self.sequence:
+            if action == "press":
+                keyboard.press_and_release(key)
+            elif action == "hold":
+                keyboard.press(key)
+            elif action == "release":
+                keyboard.release(key)
+    
+    def to_dict(self):
+        return {"type": self.command_type, "sequence": self.sequence}
+    
+    def __str__(self):
+        if not self.sequence:
+            return "KEYBOARD SEQUENCE: (empty)"
+        actions = [f"{key} {action}" for key, action in self.sequence]
+        return f"KEYBOARD: {', '.join(actions)}"
 
 
 class MouseClickCommand(MacroCommand):
@@ -274,7 +315,7 @@ class EndIfStatementCommand(MacroCommand):
 
 
 class IfImageCommand(MacroCommand):
-    def __init__(self, image_path, confidence=0.8, move_to_image=False, image_paths=None):
+    def __init__(self, image_path, confidence=0.8, move_to_image=False, image_paths=None, search_region=None):
         super().__init__("if_image")
         # Support both single image (legacy) and multiple images
         if image_paths is None:
@@ -284,6 +325,7 @@ class IfImageCommand(MacroCommand):
         self.image_path = image_path  # Keep for backwards compatibility
         self.confidence = confidence  # Keep for backwards compatibility
         self.move_to_image = move_to_image
+        self.search_region = search_region  # (x1, y1, x2, y2) or None for full screen
     
     def execute(self, context):
         # Returns True/False for if statement
@@ -293,7 +335,12 @@ class IfImageCommand(MacroCommand):
         # Try to find any of the images
         for img_info in self.image_paths:
             try:
-                location = pyautogui.locateOnScreen(img_info["path"], confidence=img_info["confidence"])
+                if self.search_region:
+                    # Search within the specified region
+                    location = pyautogui.locateOnScreen(img_info["path"], confidence=img_info["confidence"], region=self.search_region)
+                else:
+                    # Search entire screen
+                    location = pyautogui.locateOnScreen(img_info["path"], confidence=img_info["confidence"])
                 if location:
                     if self.move_to_image:
                         x, y = pyautogui.center(location)
@@ -309,7 +356,8 @@ class IfImageCommand(MacroCommand):
             "image_path": self.image_path, 
             "confidence": self.confidence, 
             "move_to_image": self.move_to_image,
-            "image_paths": self.image_paths
+            "image_paths": self.image_paths,
+            "search_region": self.search_region
         }
     
     def get_image_name(self):
@@ -321,18 +369,25 @@ class IfImageCommand(MacroCommand):
     
     def __str__(self):
         move_indicator = " [MOVE]" if self.move_to_image else ""
-        return f"IF IMAGE{move_indicator}: {self.get_image_name()}"
+        region_indicator = " [REGION]" if self.search_region else ""
+        return f"IF IMAGE{move_indicator}{region_indicator}: {self.get_image_name()}"
 
 
 class FindImageCommand(MacroCommand):
-    def __init__(self, image_path, confidence=0.8):
+    def __init__(self, image_path, confidence=0.8, search_region=None):
         super().__init__("find_image")
         self.image_path = image_path
         self.confidence = confidence
+        self.search_region = search_region  # (x1, y1, x2, y2) or None for full screen
     
     def execute(self, context):
         try:
-            location = pyautogui.locateOnScreen(self.image_path, confidence=self.confidence)
+            if self.search_region:
+                # Search within the specified region
+                location = pyautogui.locateOnScreen(self.image_path, confidence=self.confidence, region=self.search_region)
+            else:
+                # Search entire screen
+                location = pyautogui.locateOnScreen(self.image_path, confidence=self.confidence)
             if location:
                 x, y = pyautogui.center(location)
                 pyautogui.moveTo(x, y)
@@ -343,14 +398,15 @@ class FindImageCommand(MacroCommand):
             return False
     
     def to_dict(self):
-        return {"type": self.command_type, "image_path": self.image_path, "confidence": self.confidence}
+        return {"type": self.command_type, "image_path": self.image_path, "confidence": self.confidence, "search_region": self.search_region}
     
     def get_image_name(self):
         """Get just the filename without path"""
         return Path(self.image_path).stem
     
     def __str__(self):
-        return f"FIND IMAGE: {self.get_image_name()} (conf: {self.confidence})"
+        region_indicator = " [REGION]" if self.search_region else ""
+        return f"FIND IMAGE{region_indicator}: {self.get_image_name()} (conf: {self.confidence})"
 
 
 class RepeatCommand(MacroCommand):
@@ -774,6 +830,45 @@ class ClipboardPasteCommand(MacroCommand):
         return "CLIPBOARD: Paste (Ctrl+V)"
 
 
+class SoundCommand(MacroCommand):
+    def __init__(self, sound_type="beep"):
+        super().__init__("sound")
+        self.sound_type = sound_type  # "beep", "asterisk", "exclamation", "hand", "question", "custom"
+        self.custom_sound = None  # Path to custom sound file if sound_type == "custom"
+    
+    def execute(self, context):
+        if self.sound_type == "beep":
+            import winsound
+            winsound.Beep(800, 200)  # Frequency 800Hz, duration 200ms
+        elif self.sound_type == "asterisk":
+            import winsound
+            winsound.MessageBeep(winsound.MB_ICONASTERISK)
+        elif self.sound_type == "exclamation":
+            import winsound
+            winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+        elif self.sound_type == "hand":
+            import winsound
+            winsound.MessageBeep(winsound.MB_ICONHAND)
+        elif self.sound_type == "question":
+            import winsound
+            winsound.MessageBeep(winsound.MB_ICONQUESTION)
+        elif self.sound_type == "custom" and self.custom_sound:
+            import winsound
+            try:
+                winsound.PlaySound(self.custom_sound, winsound.SND_FILENAME)
+            except:
+                # Fallback to beep if custom sound fails
+                winsound.Beep(800, 200)
+    
+    def to_dict(self):
+        return {"type": self.command_type, "sound_type": self.sound_type, "custom_sound": self.custom_sound}
+    
+    def __str__(self):
+        if self.sound_type == "custom" and self.custom_sound:
+            return f"SOUND: {self.sound_type} ({self.custom_sound})"
+        return f"SOUND: {self.sound_type}"
+
+
 class Macro:
     def __init__(self, name):
         self.name = name
@@ -982,7 +1077,7 @@ class MacroMakerApp:
         scrollbar = ttk.Scrollbar(list_frame)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         
-        self.command_canvas = tk.Canvas(list_frame, yscrollcommand=scrollbar.set, bg="white", highlightthickness=1)
+        self.command_canvas = tk.Canvas(list_frame, yscrollcommand=scrollbar.set, bg="white", highlightthickness=1, takefocus=1)
         self.command_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.config(command=self.command_canvas.yview)
         
@@ -997,6 +1092,9 @@ class MacroMakerApp:
         # Bind scrolling
         self.command_frame.bind("<Configure>", lambda e: self.command_canvas.configure(scrollregion=self.command_canvas.bbox("all")))
         self.command_canvas.bind("<MouseWheel>", self._on_mousewheel)
+        
+        # Bind left-click on canvas to focus and deselect
+        self.command_canvas.bind("<Button-1>", self.on_canvas_click)
         
         # Bind right-click to canvas and frame for context menu
         self.command_canvas.bind("<Button-3>", self.show_context_menu)
@@ -1038,9 +1136,7 @@ class MacroMakerApp:
         btn_frame = ttk.Frame(middle_frame)
         btn_frame.pack(fill=tk.X)
         
-        ttk.Button(btn_frame, text="Add Key Press", command=self.add_key_press).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_frame, text="Add Key Hold", command=self.add_key_hold).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_frame, text="Add Key Release", command=self.add_key_release).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_frame, text="Add Keyboard Action", command=self.add_keyboard_sequence).pack(side=tk.LEFT, padx=2)
         ttk.Button(btn_frame, text="Add Mouse Click", command=self.add_mouse_click).pack(side=tk.LEFT, padx=2)
         ttk.Button(btn_frame, text="Add Mouse Click (Absolute)", command=self.add_mouse_click_absolute).pack(side=tk.LEFT, padx=2)
         ttk.Button(btn_frame, text="Add Mouse Move", command=self.add_mouse_move).pack(side=tk.LEFT, padx=2)
@@ -1062,6 +1158,7 @@ class MacroMakerApp:
         ttk.Button(btn_frame3, text="Add Delay", command=self.add_delay).pack(side=tk.LEFT, padx=2)
         ttk.Button(btn_frame3, text="Add Delay (ms)", command=self.add_delay_ms).pack(side=tk.LEFT, padx=2)
         ttk.Button(btn_frame3, text="Add Message", command=self.add_message).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_frame3, text="Add Sound", command=self.add_sound).pack(side=tk.LEFT, padx=2)
         
         btn_frame4 = ttk.Frame(middle_frame)
         btn_frame4.pack(fill=tk.X, pady=2)
@@ -1286,10 +1383,11 @@ class MacroMakerApp:
                 data['image_path'], 
                 data.get('confidence', 0.8), 
                 data.get('move_to_image', False),
-                data.get('image_paths', None)
+                data.get('image_paths', None),
+                data.get('search_region', None)
             )
         elif cmd_type == 'find_image':
-            return FindImageCommand(data['image_path'], data.get('confidence', 0.8))
+            return FindImageCommand(data['image_path'], data.get('confidence', 0.8), data.get('search_region', None))
         elif cmd_type == 'message':
             return MessageCommand(data['text'], data.get('always_on_top', False), data.get('always_focused', False))
         elif cmd_type == 'repeat':
@@ -1298,6 +1396,16 @@ class MacroMakerApp:
             return EndRepeatCommand()
         elif cmd_type == 'delay':
             return DelayCommand(data['seconds'])
+        elif cmd_type == 'delay_ms':
+            return DelayMsCommand(data.get('milliseconds', 100))
+        elif cmd_type == 'wait_for_window':
+            return WaitForWindowCommand(data.get('window_pattern', '*'), data.get('timeout', 30))
+        elif cmd_type == 'sound':
+            cmd = SoundCommand(data.get('sound_type', 'beep'))
+            cmd.custom_sound = data.get('custom_sound')
+            return cmd
+        elif cmd_type == 'keyboard_sequence':
+            return KeyboardSequenceCommand(data.get('sequence', []))
         elif cmd_type == 'clipboard_clear':
             return ClipboardClearCommand()
         elif cmd_type == 'clipboard_set':
@@ -1343,6 +1451,22 @@ class MacroMakerApp:
             # Store click info and schedule single-click action
             self._last_click_index = cmd_index
             self.click_timer = self.root.after(300, lambda: self.handle_single_click(cmd_index, event.y_root, widget))
+    
+    def on_canvas_click(self, event):
+        """Handle click on canvas (empty area)"""
+        # Check if click was on a command frame
+        widget = self.command_canvas.winfo_containing(event.x_root, event.y_root)
+        if widget:
+            # Traverse up to see if it's a command frame
+            while widget and widget != self.command_frame:
+                if hasattr(widget, '_command_index'):
+                    return  # Let the command click handler deal with it
+                widget = widget.master
+        
+        # Click was on empty area - deselect and focus canvas
+        self.selected_index = None
+        self.update_command_list()
+        self.command_canvas.focus_set()
     
     def handle_single_click(self, cmd_index, y_root, widget):
         """Handle confirmed single click after delay"""
@@ -1630,14 +1754,20 @@ class MacroMakerApp:
         
         # Find which command frame was clicked
         widget = event.widget
+        clicked_command = None
         while widget and not hasattr(widget, '_command_index'):
             widget = widget.master
             if widget == self.command_frame:
-                return
+                break
         
         if widget and hasattr(widget, '_command_index'):
-            self.selected_index = widget._command_index
+            clicked_command = widget._command_index
+        
+        # Set selection based on what was clicked
+        if clicked_command is not None:
+            self.selected_index = clicked_command
             self.update_command_list()
+        # If clicked on empty space, don't change selection
         
         # Create context menu
         menu = tk.Menu(self.root, tearoff=0)
@@ -1654,6 +1784,7 @@ class MacroMakerApp:
         keyboard_menu.add_command(label="Press", underline=0, command=lambda: self.insert_command_at_selection("key_press"))
         keyboard_menu.add_command(label="Hold", underline=0, command=lambda: self.insert_command_at_selection("key_hold"))
         keyboard_menu.add_command(label="Release", underline=0, command=lambda: self.insert_command_at_selection("key_release"))
+        keyboard_menu.add_command(label="Sequence", underline=0, command=lambda: self.insert_command_at_selection("keyboard_sequence"))
         menu.add_cascade(label="Keyboard Commands", underline=0, menu=keyboard_menu)
         
         # Image commands submenu
@@ -1686,6 +1817,7 @@ class MacroMakerApp:
         timing_menu.add_command(label="Delay (Milliseconds)", underline=7, command=lambda: self.insert_command_at_selection("delay_ms"))
         timing_menu.add_command(label="Wait for Window", underline=0, command=lambda: self.insert_command_at_selection("wait_for_window"))
         timing_menu.add_command(label="Message", underline=0, command=lambda: self.insert_command_at_selection("message"))
+        timing_menu.add_command(label="Sound", underline=0, command=lambda: self.insert_command_at_selection("sound"))
         menu.add_cascade(label="Timing/Utility", underline=0, menu=timing_menu)
         
         # Add separator and Copy/Paste/Delete options
@@ -1715,6 +1847,7 @@ class MacroMakerApp:
             "key_press": self.add_key_press,
             "key_hold": self.add_key_hold,
             "key_release": self.add_key_release,
+            "keyboard_sequence": self.add_keyboard_sequence,
             "if_statement": self.add_if,
             "else": self.add_else,
             "end_if": self.add_endif,
@@ -1722,6 +1855,7 @@ class MacroMakerApp:
             "end_repeat": self.add_end_repeat,
             "delay": self.add_delay,
             "delay_ms": self.add_delay_ms,
+            "sound": self.add_sound,
         }
         
         # Special handlers for commands with custom logic
@@ -1729,6 +1863,20 @@ class MacroMakerApp:
             self.add_if_image_at_index(insert_index)
         elif command_type == "find_image":
             self.add_find_image_at_index(insert_index)
+        elif command_type == "clipboard_clear":
+            self.add_clipboard_clear(insert_index)
+        elif command_type == "clipboard_set":
+            self.add_clipboard_set(insert_index)
+        elif command_type == "clipboard_increment":
+            self.add_clipboard_increment(insert_index)
+        elif command_type == "clipboard_copy":
+            self.add_clipboard_copy(insert_index)
+        elif command_type == "clipboard_paste":
+            self.add_clipboard_paste(insert_index)
+        elif command_type == "wait_for_window":
+            self.add_wait_for_window_at_index(insert_index)
+        elif command_type == "message":
+            self.add_message_at_index(insert_index)
         elif command_type in command_map:
             command_map[command_type](insert_index)
     
@@ -1953,18 +2101,6 @@ class MacroMakerApp:
         
         keyboard.hook(on_key)
         
-        # Center the dialog
-        dialog.update_idletasks()
-        width = dialog.winfo_width()
-        height = dialog.winfo_height()
-        screen_width = dialog.winfo_screenwidth()
-        screen_height = dialog.winfo_screenheight()
-        x = (screen_width - width) // 2
-        y = (screen_height - height) // 2
-        dialog.geometry(f"{width}x{height}+{x}+{y}")
-        
-        self.ensure_dialog_focused(dialog)
-        
         def on_ok():
             keyboard.unhook_all()
             if captured_keys:
@@ -1996,23 +2132,17 @@ class MacroMakerApp:
         # Bind Escape to cancel
         dialog.bind('<Escape>', lambda e: on_cancel())
         
-        # Re-center after a short delay
-        def recenter():
-            dialog.update_idletasks()
-            w = dialog.winfo_width()
-            h = dialog.winfo_height()
-            sw = dialog.winfo_screenwidth()
-            sh = dialog.winfo_screenheight()
-            new_x = (sw - w) // 2
-            new_y = (sh - h) // 2
-            dialog.geometry(f"{w}x{h}+{new_x}+{new_y}")
-            dialog.focus_force()
-            dialog.lift()
-            # Refocus OK button after recentering
-            ok_btn.focus_set()
+        # Center the dialog after packing all widgets
+        dialog.update_idletasks()
+        width = dialog.winfo_width()
+        height = dialog.winfo_height()
+        screen_width = dialog.winfo_screenwidth()
+        screen_height = dialog.winfo_screenheight()
+        x = (screen_width - width) // 2
+        y = (screen_height - height) // 2
+        dialog.geometry(f"{width}x{height}+{x}+{y}")
         
-        dialog.after(10, recenter)
-        dialog.after(30, recenter)
+        self.ensure_dialog_focused(dialog)
     
     def register_hotkey(self, macro):
         """Register a hotkey for a macro"""
@@ -2182,6 +2312,388 @@ class MacroMakerApp:
         dialog.wait_window()
         return result['key']
     
+    def show_sound_selector(self):
+        """Show dialog to select a sound type"""
+        sound_types = [
+            ("beep", "Simple beep sound"),
+            ("asterisk", "Asterisk (system sound)"),
+            ("exclamation", "Exclamation (system sound)"),
+            ("hand", "Hand (error sound)"),
+            ("question", "Question (system sound)"),
+            ("custom", "Custom sound file...")
+        ]
+        
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Select Sound")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        result = {'command': None}
+        
+        tk.Label(dialog, text="Choose a sound to play:", font=("Arial", 10)).pack(pady=10, padx=20)
+        
+        # Sound type selection
+        sound_var = tk.StringVar(value="beep")
+        
+        def play_sound(sound_type):
+            """Play a preview of the selected sound type"""
+            if sound_type == "beep":
+                import winsound
+                winsound.Beep(800, 200)
+            elif sound_type == "asterisk":
+                import winsound
+                winsound.MessageBeep(winsound.MB_ICONASTERISK)
+            elif sound_type == "exclamation":
+                import winsound
+                winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+            elif sound_type == "hand":
+                import winsound
+                winsound.MessageBeep(winsound.MB_ICONHAND)
+            elif sound_type == "question":
+                import winsound
+                winsound.MessageBeep(winsound.MB_ICONQUESTION)
+            elif sound_type == "custom":
+                # For custom, try to play the selected file, or play a default beep
+                custom_path = custom_entry.get().strip()
+                if custom_path:
+                    try:
+                        import winsound
+                        winsound.PlaySound(custom_path, winsound.SND_FILENAME)
+                    except:
+                        # Fallback to beep
+                        winsound.Beep(800, 200)
+                else:
+                    # No file selected, play default beep
+                    import winsound
+                    winsound.Beep(800, 200)
+        
+        for sound_type, description in sound_types:
+            # Create a frame for each sound option
+            option_frame = ttk.Frame(dialog)
+            option_frame.pack(fill=tk.X, padx=20, pady=2)
+            
+            # Radio button
+            ttk.Radiobutton(
+                option_frame, 
+                text=f"{sound_type.title()}: {description}", 
+                variable=sound_var, 
+                value=sound_type
+            ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+            
+            # Play button
+            play_btn = ttk.Button(
+                option_frame, 
+                text="▶", 
+                width=3, 
+                command=lambda st=sound_type: play_sound(st)
+            )
+            play_btn.pack(side=tk.RIGHT)
+        
+        # Custom sound file entry (initially hidden)
+        custom_frame = ttk.Frame(dialog)
+        custom_label = ttk.Label(custom_frame, text="Sound file path:")
+        custom_entry = ttk.Entry(custom_frame, width=40)
+        custom_browse = ttk.Button(custom_frame, text="Browse...", command=lambda: self.browse_sound_file(custom_entry))
+        
+        def on_sound_change(*args):
+            if sound_var.get() == "custom":
+                custom_frame.pack(pady=5, padx=20, fill=tk.X)
+                custom_entry.focus_set()
+            else:
+                custom_frame.pack_forget()
+        
+        sound_var.trace_add("write", on_sound_change)
+        
+        custom_label.pack(side=tk.LEFT)
+        custom_entry.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+        custom_browse.pack(side=tk.RIGHT)
+        
+        def on_ok():
+            sound_type = sound_var.get()
+            custom_sound = None
+            if sound_type == "custom":
+                custom_sound = custom_entry.get().strip()
+                if not custom_sound:
+                    messagebox.showwarning("Warning", "Please select a sound file")
+                    return
+            
+            cmd = SoundCommand(sound_type)
+            cmd.custom_sound = custom_sound
+            result['command'] = cmd
+            dialog.destroy()
+        
+        def on_cancel():
+            dialog.destroy()
+        
+        btn_frame = tk.Frame(dialog)
+        btn_frame.pack(pady=10)
+        ok_btn = ttk.Button(btn_frame, text="OK", command=on_ok)
+        ok_btn.pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Cancel", command=on_cancel).pack(side=tk.LEFT, padx=5)
+        
+        # Center the dialog
+        dialog.update_idletasks()
+        width = dialog.winfo_width()
+        height = dialog.winfo_height()
+        screen_width = dialog.winfo_screenwidth()
+        screen_height = dialog.winfo_screenheight()
+        x = (screen_width - width) // 2
+        y = (screen_height - height) // 2
+        dialog.geometry(f"{width}x{height}+{x}+{y}")
+        
+        self.ensure_dialog_focused(dialog)
+        
+        dialog.wait_window()
+        return result['command']
+    
+    def browse_sound_file(self, entry):
+        """Browse for a sound file"""
+        from tkinter import filedialog
+        filename = filedialog.askopenfilename(
+            title="Select Sound File",
+            filetypes=[
+                ("Sound files", "*.wav *.mp3 *.ogg"),
+                ("WAV files", "*.wav"),
+                ("MP3 files", "*.mp3"),
+                ("OGG files", "*.ogg"),
+                ("All files", "*.*")
+            ]
+        )
+        if filename:
+            entry.delete(0, tk.END)
+            entry.insert(0, filename)
+    
+    def show_keyboard_sequence_dialog(self):
+        """Show dialog to create a keyboard sequence command"""
+        # Comprehensive list of all keyboard keys (same as show_key_selector)
+        all_keys = [
+            # Letters
+            'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm',
+            'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
+            # Numbers
+            '0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
+            # Numpad
+            'num0', 'num1', 'num2', 'num3', 'num4', 'num5', 'num6', 'num7', 'num8', 'num9',
+            'num lock', 'num /', 'num *', 'num -', 'num +', 'num enter', 'num .', 
+            # Function keys
+            'f1', 'f2', 'f3', 'f4', 'f5', 'f6', 'f7', 'f8', 'f9', 'f10', 'f11', 'f12',
+            'f13', 'f14', 'f15', 'f16', 'f17', 'f18', 'f19', 'f20', 'f21', 'f22', 'f23', 'f24',
+            # Special keys
+            'enter', 'return', 'tab', 'space', 'backspace', 'delete', 'esc', 'escape',
+            # Navigation
+            'up', 'down', 'left', 'right', 'home', 'end', 'page up', 'page down',
+            'insert', 'print screen', 'scroll lock', 'pause',
+            # Modifiers
+            'shift', 'left shift', 'right shift',
+            'ctrl', 'left ctrl', 'right ctrl', 'control', 'left control', 'right control',
+            'alt', 'left alt', 'right alt',
+            'win', 'left win', 'right win', 'windows', 'left windows', 'right windows',
+            'caps lock', 'menu', 'apps',
+            # Symbols
+            '-', '=', '[', ']', '\\', ';', "'", ',', '.', '/',
+            '`', '~', '!', '@', '#', '$', '%', '^', '&', '*', '(', ')', '_', '+',
+            '{', '}', '|', ':', '"', '<', '>', '?',
+        ]
+        
+        actions = ['press', 'hold', 'release']
+        
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Keyboard Sequence")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        result = {'sequence': []}
+        
+        tk.Label(dialog, text="Build your keyboard sequence:", font=("Arial", 10)).pack(pady=10, padx=20)
+        
+        # Frame for the sequence items
+        sequence_frame = ttk.Frame(dialog)
+        sequence_frame.pack(pady=5, padx=20, fill=tk.BOTH, expand=True)
+        
+        # List to hold the row frames
+        row_frames = []
+        current_row = 0  # Track which row has focus
+        
+        def add_sequence_row(key='', action='press'):
+            """Add a new row for key-action pair"""
+            row_frame = ttk.Frame(sequence_frame)
+            row_frame.pack(fill=tk.X, pady=2)
+            
+            # Key dropdown
+            key_var = tk.StringVar(value=key)
+            key_combo = ttk.Combobox(row_frame, textvariable=key_var, values=all_keys, width=15, state='readonly')
+            key_combo.pack(side=tk.LEFT, padx=2)
+            
+            # Type-ahead search state for this combo
+            search_state = {
+                'last_key': '',
+                'last_time': 0,
+                'current_index': -1
+            }
+            
+            def on_key_press(event):
+                import time
+                
+                # Ignore special keys
+                if len(event.char) != 1 or not event.char.isalnum() and event.char not in "'-.":
+                    return
+                
+                char = event.char.lower()
+                current_time = time.time()
+                
+                # If same key pressed within 0.8 seconds, move to next match
+                if char == search_state['last_key'] and (current_time - search_state['last_time']) < 0.8:
+                    # Find next match after current index
+                    start_index = search_state['current_index'] + 1
+                else:
+                    # New search, start from beginning
+                    start_index = 0
+                    search_state['current_index'] = -1
+                
+                # Search for matching key
+                found = False
+                for i in range(start_index, len(all_keys)):
+                    if all_keys[i].lower().startswith(char):
+                        key_combo.current(i)
+                        search_state['current_index'] = i
+                        found = True
+                        break
+                
+                # If no match found after current position, wrap to beginning
+                if not found and start_index > 0:
+                    for i in range(0, start_index):
+                        if all_keys[i].lower().startswith(char):
+                            key_combo.current(i)
+                            search_state['current_index'] = i
+                            found = True
+                            break
+                
+                search_state['last_key'] = char
+                search_state['last_time'] = current_time
+                
+                return "break"  # Prevent default typing behavior
+            
+            # Bind key press for type-ahead search
+            key_combo.bind('<KeyPress>', on_key_press)
+            
+            # Action selection (using buttons for left/right as requested)
+            action_var = tk.StringVar(value=action)
+            
+            def select_action(new_action):
+                action_var.set(new_action)
+                update_action_buttons()
+            
+            action_frame = ttk.Frame(row_frame)
+            action_frame.pack(side=tk.LEFT, padx=5)
+            
+            left_btn = ttk.Button(action_frame, text="◀", width=3, command=lambda: select_action(actions[(actions.index(action_var.get()) - 1) % len(actions)]))
+            action_label = ttk.Label(action_frame, textvariable=action_var, width=8, anchor='center')
+            right_btn = ttk.Button(action_frame, text="▶", width=3, command=lambda: select_action(actions[(actions.index(action_var.get()) + 1) % len(actions)]))
+            
+            left_btn.pack(side=tk.LEFT)
+            action_label.pack(side=tk.LEFT)
+            right_btn.pack(side=tk.LEFT)
+            
+            def update_action_buttons():
+                current = action_var.get()
+                idx = actions.index(current)
+                # Enable/disable based on position
+                left_btn.config(state='normal')
+                right_btn.config(state='normal')
+            
+            update_action_buttons()
+            
+            # Focus tracking
+            def on_combo_focus(event):
+                current_row = row_frames.index((row_frame, key_var, action_var, key_combo))
+            
+            key_combo.bind('<FocusIn>', on_combo_focus)
+            
+            row_frames.append((row_frame, key_var, action_var, key_combo))
+            return row_frame
+            """Remove a row"""
+            for i, (rf, kv, av, kc) in enumerate(row_frames):
+                if rf == row_frame:
+                    rf.destroy()
+                    del row_frames[i]
+                    break
+        
+        # Add initial row
+        add_sequence_row()
+        
+        # Focus the first combo
+        if row_frames:
+            _, _, _, first_combo = row_frames[0]
+            dialog.after(100, lambda: first_combo.focus_set())
+        
+        # Add key button
+        def add_and_focus():
+            add_sequence_row()
+            if row_frames:
+                _, _, _, last_combo = row_frames[-1]
+                last_combo.focus_set()
+        
+        ttk.Button(dialog, text="Add Key", command=add_and_focus).pack(pady=5)
+        
+        # Keyboard navigation
+        def change_action(direction):
+            if row_frames:
+                _, _, action_var, _ = row_frames[current_row]
+                current_action = action_var.get()
+                idx = actions.index(current_action)
+                new_idx = (idx + direction) % len(actions)
+                action_var.set(actions[new_idx])
+        
+        def move_focus(direction):
+            if row_frames:
+                nonlocal current_row
+                current_row = (current_row + direction) % len(row_frames)
+                _, _, _, key_combo = row_frames[current_row]
+                key_combo.focus_set()
+        
+        # Bind arrow keys for navigation
+        dialog.bind('<Left>', lambda e: change_action(-1))
+        dialog.bind('<Right>', lambda e: change_action(1))
+        dialog.bind('<Up>', lambda e: move_focus(-1))
+        dialog.bind('<Down>', lambda e: move_focus(1))
+        
+        def on_ok():
+            sequence = []
+            for _, key_var, action_var, _ in row_frames:
+                key = key_var.get()
+                action = action_var.get()
+                if key:
+                    sequence.append((key, action))
+            if sequence:
+                result['sequence'] = sequence
+                dialog.destroy()
+            else:
+                messagebox.showwarning("Warning", "Please add at least one key action")
+        
+        def on_cancel():
+            dialog.destroy()
+        
+        btn_frame = tk.Frame(dialog)
+        btn_frame.pack(pady=10)
+        ok_btn = ttk.Button(btn_frame, text="OK", command=on_ok)
+        ok_btn.pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Cancel", command=on_cancel).pack(side=tk.LEFT, padx=5)
+        
+        # Center the dialog
+        dialog.update_idletasks()
+        width = dialog.winfo_width()
+        height = dialog.winfo_height()
+        screen_width = dialog.winfo_screenwidth()
+        screen_height = dialog.winfo_screenheight()
+        x = (screen_width - width) // 2
+        y = (screen_height - height) // 2
+        dialog.geometry(f"{width}x{height}+{x}+{y}")
+        
+        self.ensure_dialog_focused(dialog)
+        
+        dialog.wait_window()
+        return result['sequence']
+    
     def add_key_press(self, insert_index=None):
         """Add key press command"""
         if not self.current_macro:
@@ -2232,6 +2744,24 @@ class MacroMakerApp:
                 self.selected_index = insert_index
             else:
                 self.current_macro.add_command(KeyReleaseCommand(key))
+                self.selected_index = len(self.current_macro.commands) - 1
+            self.update_command_list()
+            self.save_macros()
+    
+    def add_keyboard_sequence(self, insert_index=None):
+        """Add keyboard sequence command"""
+        if not self.current_macro:
+            messagebox.showwarning("Warning", "Please select a macro first")
+            return
+        
+        sequence = self.show_keyboard_sequence_dialog()
+        if sequence:
+            self.save_state()
+            if insert_index is not None:
+                self.current_macro.commands.insert(insert_index, KeyboardSequenceCommand(sequence))
+                self.selected_index = insert_index
+            else:
+                self.current_macro.add_command(KeyboardSequenceCommand(sequence))
                 self.selected_index = len(self.current_macro.commands) - 1
             self.update_command_list()
             self.save_macros()
@@ -2288,7 +2818,7 @@ class MacroMakerApp:
                 # Capture the selected region
                 time.sleep(0.2)  # Small delay to ensure window is closed
                 screenshot = ImageGrab.grab(bbox=(x1, y1, x2, y2))
-                return screenshot
+                return screenshot, (x1, y1, x2, y2)
         
         return None
     
@@ -2577,8 +3107,9 @@ class MacroMakerApp:
             return
         
         # Capture screen region
-        screenshot = self.capture_screen_region()
-        if screenshot:
+        result = self.capture_screen_region()
+        if result:
+            screenshot, _ = result
             image_path = f"images/{image_name}.png"
             os.makedirs("images", exist_ok=True)
             screenshot.save(image_path)
@@ -2611,10 +3142,25 @@ class MacroMakerApp:
             move_var = tk.BooleanVar(value=False)
             tk.Checkbutton(dialog, text="Move mouse to image if found", variable=move_var).pack(pady=10)
             
+            # Search within area checkbox
+            search_area_var = tk.BooleanVar(value=False)
+            tk.Checkbutton(dialog, text="Search within area", variable=search_area_var).pack(pady=10)
+            
             # Buttons
             def save_options():
+                search_region = None
+                if search_area_var.get():
+                    # Capture search area
+                    messagebox.showinfo("Search Area", "Click and drag to select the area to search within.")
+                    result = self.capture_screen_region()
+                    if result:
+                        search_screenshot, search_region = result
+                    else:
+                        messagebox.showwarning("Warning", "No search area selected. Searching entire screen.")
+                        search_region = None
+                
                 self.save_state()
-                self.current_macro.add_command(IfImageCommand(image_path, conf_var.get(), move_var.get()))
+                self.current_macro.add_command(IfImageCommand(image_path, conf_var.get(), move_var.get(), None, search_region))
                 # Auto-insert ENDIF right after IF IMAGE
                 self.current_macro.commands.insert(len(self.current_macro.commands), EndIfStatementCommand())
                 # Select IF IMAGE (not ENDIF)
@@ -2668,8 +3214,9 @@ class MacroMakerApp:
         if not image_name:
             return
         
-        screenshot = self.capture_screen_region()
-        if screenshot:
+        result = self.capture_screen_region()
+        if result:
+            screenshot, _ = result
             image_path = f"images/{image_name}.png"
             os.makedirs("images", exist_ok=True)
             screenshot.save(image_path)
@@ -2751,8 +3298,9 @@ class MacroMakerApp:
         if not image_name:
             return
         
-        screenshot = self.capture_screen_region()
-        if screenshot:
+        result = self.capture_screen_region()
+        if result:
+            screenshot, _ = result
             image_path = f"images/{image_name}.png"
             os.makedirs("images", exist_ok=True)
             screenshot.save(image_path)
@@ -2761,7 +3309,9 @@ class MacroMakerApp:
             
             confidence = simpledialog.askfloat("Confidence", "Enter confidence (0.0-1.0):", initialvalue=0.8)
             if confidence is not None:
+                self.save_state()
                 self.current_macro.commands.insert(insert_index, FindImageCommand(image_path, confidence))
+                self.selected_index = insert_index
                 self.update_command_list()
                 self.save_macros()
     
@@ -2776,8 +3326,9 @@ class MacroMakerApp:
             return
         
         # Capture screen region
-        screenshot = self.capture_screen_region()
-        if screenshot:
+        result = self.capture_screen_region()
+        if result:
+            screenshot, _ = result
             image_path = f"images/{image_name}.png"
             os.makedirs("images", exist_ok=True)
             screenshot.save(image_path)
@@ -2785,13 +3336,71 @@ class MacroMakerApp:
             # Show preview
             self.show_image_preview(screenshot, "Captured Image")
             
-            confidence = simpledialog.askfloat("Confidence", "Enter confidence (0.0-1.0):", initialvalue=0.8)
-            if confidence is not None:
+            # Create dialog for options
+            dialog = tk.Toplevel(self.root)
+            dialog.title("FIND IMAGE Options")
+            dialog.transient(self.root)
+            dialog.grab_set()
+            
+            # Confidence slider
+            conf_frame = ttk.Frame(dialog)
+            conf_frame.pack(pady=10)
+            ttk.Label(conf_frame, text="Confidence:").pack(side=tk.LEFT, padx=5)
+            conf_var = tk.DoubleVar(value=0.8)
+            conf_scale = ttk.Scale(conf_frame, from_=0.1, to=1.0, variable=conf_var, orient=tk.HORIZONTAL, length=150)
+            conf_scale.pack(side=tk.LEFT, padx=5)
+            conf_label = ttk.Label(conf_frame, text="0.80")
+            conf_label.pack(side=tk.LEFT, padx=5)
+            
+            def update_conf_label(event=None):
+                conf_label.config(text=f"{conf_var.get():.2f}")
+            conf_scale.bind("<Motion>", update_conf_label)
+            conf_scale.bind("<ButtonRelease-1>", update_conf_label)
+            
+            # Search within area checkbox
+            search_area_var = tk.BooleanVar(value=False)
+            tk.Checkbutton(dialog, text="Search within area", variable=search_area_var).pack(pady=10)
+            
+            # Buttons
+            def save_options():
+                search_region = None
+                if search_area_var.get():
+                    # Capture search area
+                    messagebox.showinfo("Search Area", "Click and drag to select the area to search within.")
+                    result = self.capture_screen_region()
+                    if result:
+                        search_screenshot, search_region = result
+                    else:
+                        messagebox.showwarning("Warning", "No search area selected. Searching entire screen.")
+                        search_region = None
+                
                 self.save_state()
-                self.current_macro.add_command(FindImageCommand(image_path, confidence))
+                self.current_macro.add_command(FindImageCommand(image_path, conf_var.get(), search_region))
                 self.selected_index = len(self.current_macro.commands) - 1
                 self.update_command_list()
                 self.save_macros()
+                dialog.destroy()
+            
+            btn_frame = tk.Frame(dialog)
+            btn_frame.pack(pady=20)
+            ok_btn = tk.Button(btn_frame, text="OK", command=save_options, width=10)
+            ok_btn.pack(side=tk.LEFT, padx=5)
+            tk.Button(btn_frame, text="Cancel", command=dialog.destroy, width=10).pack(side=tk.LEFT, padx=5)
+            
+            # Bind Escape to cancel
+            dialog.bind('<Escape>', lambda e: dialog.destroy())
+            
+            # Center the dialog
+            dialog.update_idletasks()
+            width = dialog.winfo_width()
+            height = dialog.winfo_height()
+            screen_width = dialog.winfo_screenwidth()
+            screen_height = dialog.winfo_screenheight()
+            x = (screen_width - width) // 2
+            y = (screen_height - height) // 2
+            dialog.geometry(f"{width}x{height}+{x}+{y}")
+            
+            self.ensure_dialog_focused(dialog)
     
     def add_message(self):
         """Add message command"""
@@ -2963,6 +3572,182 @@ class MacroMakerApp:
                 self.selected_index = len(self.current_macro.commands) - 1
                 self.update_command_list()
                 self.save_macros()
+    
+    def add_wait_for_window_at_index(self, insert_index):
+        """Add wait for window command at specific index"""
+        if not self.current_macro:
+            messagebox.showwarning("Warning", "Please select a macro first")
+            return
+        
+        pattern = simpledialog.askstring("Wait For Window", "Enter window title pattern (use * as wildcard):")
+        if pattern:
+            timeout = simpledialog.askinteger("Timeout", "Enter timeout in seconds:", initialvalue=30)
+            if timeout is not None:
+                self.save_state()
+                self.current_macro.commands.insert(insert_index, WaitForWindowCommand(pattern, timeout))
+                self.selected_index = insert_index
+                self.update_command_list()
+                self.save_macros()
+    
+    def add_message_at_index(self, insert_index):
+        """Add message command at specific index"""
+        if not self.current_macro:
+            messagebox.showwarning("Warning", "Please select a macro first")
+            return
+        
+        # Create dialog for message options
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Add Message")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        tk.Label(dialog, text="Enter message to display:").pack(pady=10)
+        
+        text_var = tk.StringVar()
+        text_entry = tk.Entry(dialog, textvariable=text_var, width=50)
+        text_entry.pack(pady=5)
+        text_entry.focus()
+        
+        always_on_top_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(dialog, text="Always on top", variable=always_on_top_var).pack(pady=5)
+        
+        always_focused_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(dialog, text="Always focused", variable=always_focused_var).pack(pady=5)
+        
+        def save_message():
+            text = text_var.get()
+            if text:
+                self.save_state()
+                self.current_macro.commands.insert(insert_index, MessageCommand(text, always_on_top_var.get(), always_focused_var.get()))
+                self.selected_index = insert_index
+                self.update_command_list()
+                self.save_macros()
+                dialog.destroy()
+            else:
+                messagebox.showwarning("Warning", "Please enter a message")
+        
+        btn_frame = tk.Frame(dialog)
+        btn_frame.pack(pady=20)
+        tk.Button(btn_frame, text="OK", command=save_message, width=10).pack(side=tk.LEFT, padx=5)
+        tk.Button(btn_frame, text="Cancel", command=dialog.destroy, width=10).pack(side=tk.LEFT, padx=5)
+        
+        text_entry.bind("<Return>", lambda e: save_message())
+        dialog.bind('<Escape>', lambda e: dialog.destroy())
+        
+        dialog.update_idletasks()
+        width = dialog.winfo_width()
+        height = dialog.winfo_height()
+        screen_width = dialog.winfo_screenwidth()
+        screen_height = dialog.winfo_screenheight()
+        x = (screen_width - width) // 2
+        y = (screen_height - height) // 2
+        dialog.geometry(f"{width}x{height}+{x}+{y}")
+        self.ensure_dialog_focused(dialog)
+    
+    def add_clipboard_clear(self, insert_index=None):
+        """Add clipboard clear command"""
+        if not self.current_macro:
+            messagebox.showwarning("Warning", "Please select a macro first")
+            return
+        
+        self.save_state()
+        cmd = ClipboardClearCommand()
+        if insert_index is not None:
+            self.current_macro.commands.insert(insert_index, cmd)
+            self.selected_index = insert_index
+        else:
+            self.current_macro.add_command(cmd)
+            self.selected_index = len(self.current_macro.commands) - 1
+        self.update_command_list()
+        self.save_macros()
+    
+    def add_clipboard_set(self, insert_index=None):
+        """Add clipboard set command"""
+        if not self.current_macro:
+            messagebox.showwarning("Warning", "Please select a macro first")
+            return
+        
+        value = simpledialog.askstring("Clipboard Set", "Enter value to copy to clipboard:")
+        if value is not None:
+            self.save_state()
+            cmd = ClipboardSetCommand(value)
+            if insert_index is not None:
+                self.current_macro.commands.insert(insert_index, cmd)
+                self.selected_index = insert_index
+            else:
+                self.current_macro.add_command(cmd)
+                self.selected_index = len(self.current_macro.commands) - 1
+            self.update_command_list()
+            self.save_macros()
+    
+    def add_clipboard_increment(self, insert_index=None):
+        """Add clipboard increment command"""
+        if not self.current_macro:
+            messagebox.showwarning("Warning", "Please select a macro first")
+            return
+        
+        self.save_state()
+        cmd = ClipboardIncrementCommand()
+        if insert_index is not None:
+            self.current_macro.commands.insert(insert_index, cmd)
+            self.selected_index = insert_index
+        else:
+            self.current_macro.add_command(cmd)
+            self.selected_index = len(self.current_macro.commands) - 1
+        self.update_command_list()
+        self.save_macros()
+    
+    def add_clipboard_copy(self, insert_index=None):
+        """Add clipboard copy command"""
+        if not self.current_macro:
+            messagebox.showwarning("Warning", "Please select a macro first")
+            return
+        
+        self.save_state()
+        cmd = ClipboardCopyCommand()
+        if insert_index is not None:
+            self.current_macro.commands.insert(insert_index, cmd)
+            self.selected_index = insert_index
+        else:
+            self.current_macro.add_command(cmd)
+            self.selected_index = len(self.current_macro.commands) - 1
+        self.update_command_list()
+        self.save_macros()
+    
+    def add_clipboard_paste(self, insert_index=None):
+        """Add clipboard paste command"""
+        if not self.current_macro:
+            messagebox.showwarning("Warning", "Please select a macro first")
+            return
+        
+        self.save_state()
+        cmd = ClipboardPasteCommand()
+        if insert_index is not None:
+            self.current_macro.commands.insert(insert_index, cmd)
+            self.selected_index = insert_index
+        else:
+            self.current_macro.add_command(cmd)
+            self.selected_index = len(self.current_macro.commands) - 1
+        self.update_command_list()
+        self.save_macros()
+    
+    def add_sound(self, insert_index=None):
+        """Add sound command"""
+        if not self.current_macro:
+            messagebox.showwarning("Warning", "Please select a macro first")
+            return
+        
+        sound_cmd = self.show_sound_selector()
+        if sound_cmd:
+            self.save_state()
+            if insert_index is not None:
+                self.current_macro.commands.insert(insert_index, sound_cmd)
+                self.selected_index = insert_index
+            else:
+                self.current_macro.add_command(sound_cmd)
+                self.selected_index = len(self.current_macro.commands) - 1
+            self.update_command_list()
+            self.save_macros()
     
     def copy_command(self, event=None):
         """Copy selected command"""
@@ -3582,8 +4367,9 @@ class MacroMakerApp:
                     return
                 
                 image_name = name_var.get()
-                screenshot = self.capture_screen_region()
-                if screenshot:
+                result = self.capture_screen_region()
+                if result:
+                    screenshot, _ = result
                     image_path = f"images/{image_name}.png"
                     os.makedirs("images", exist_ok=True)
                     screenshot.save(image_path)
@@ -3764,8 +4550,9 @@ class MacroMakerApp:
             btn_frame.pack(pady=20)
             
             def recapture():
-                screenshot = self.capture_screen_region()
-                if screenshot:
+                result = self.capture_screen_region()
+                if result:
+                    screenshot, _ = result
                     self.save_state()
                     screenshot.save(cmd.image_path)
                     # Clear thumbnail cache to force refresh
