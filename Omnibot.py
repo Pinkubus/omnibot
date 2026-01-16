@@ -532,6 +532,10 @@ class MacroCommand:
             return ClipboardPasteCommand()
         elif cmd_type == "clipboard_edit":
             return ClipboardEditCommand(data.get("operation", "remove_spaces"))
+        elif cmd_type == "capture_screen":
+            return CaptureScreenCommand(data.get("x1"), data.get("y1"), data.get("x2"), data.get("y2"))
+        elif cmd_type == "save_clipboard_image":
+            return SaveClipboardImageCommand(data.get("filename"))
         return None
     
     def __str__(self):
@@ -1335,6 +1339,86 @@ class CaptureScreenCommand(MacroCommand):
         return f"CAPTURE SCREEN: ({self.x1}, {self.y1}) to ({self.x2}, {self.y2})"
 
 
+class SaveClipboardImageCommand(MacroCommand):
+    def __init__(self, filename=None):
+        super().__init__("save_clipboard_image")
+        self.filename = filename  # Optional custom filename
+    
+    def execute(self, context):
+        from PIL import ImageGrab
+        import win32clipboard
+        from io import BytesIO
+        import os
+        
+        try:
+            # Try to get image from clipboard
+            win32clipboard.OpenClipboard()
+            try:
+                # Check if clipboard has image data
+                if win32clipboard.IsClipboardFormatAvailable(win32clipboard.CF_DIB):
+                    data = win32clipboard.GetClipboardData(win32clipboard.CF_DIB)
+                    win32clipboard.CloseClipboard()
+                    
+                    # Convert DIB to PIL Image
+                    import struct
+                    # DIB header is 40 bytes
+                    dib = data
+                    # Create BMP header
+                    bmp_header = struct.pack('<2sIHHI', b'BM', 14 + len(dib), 0, 0, 14 + 40)
+                    bmp_data = bmp_header + dib
+                    
+                    image = ImageGrab.grabclipboard()
+                    if image is None:
+                        # Try alternative method
+                        from PIL import Image
+                        image = Image.open(BytesIO(bmp_data))
+                else:
+                    win32clipboard.CloseClipboard()
+                    # Try using PIL's grabclipboard
+                    image = ImageGrab.grabclipboard()
+                    
+                if image is None:
+                    print("No image found in clipboard")
+                    return
+                
+                # Get desktop path
+                desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+                
+                # Generate filename if not provided
+                if self.filename:
+                    filepath = os.path.join(desktop, self.filename)
+                else:
+                    # Generate timestamped filename with microseconds for uniqueness
+                    import datetime
+                    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                    filepath = os.path.join(desktop, f"clipboard_image_{timestamp}.png")
+                
+                # Save the image
+                image.save(filepath)
+                print(f"Image saved to: {filepath}")
+                
+            except Exception as e:
+                try:
+                    win32clipboard.CloseClipboard()
+                except:
+                    pass
+                raise e
+        except Exception as e:
+            print(f"Error saving clipboard image: {e}")
+    
+    def to_dict(self):
+        return {
+            "type": self.command_type,
+            "filename": self.filename
+        }
+    
+    def __str__(self):
+        if self.filename:
+            return f"SAVE CLIPBOARD IMAGE: {self.filename}"
+        else:
+            return "SAVE CLIPBOARD IMAGE: (auto-named)"
+
+
 class ClipboardEditCommand(MacroCommand):
     def __init__(self, operation):
         super().__init__("clipboard_edit")
@@ -1413,6 +1497,7 @@ class Macro:
         self.commands = []
         self.hotkey = None
         self.window_geometry = None  # Store window position/size as "widthxheight+x+y"
+        self.repeat_count = 1  # Default repeat count for this macro
     
     def add_command(self, command):
         self.commands.append(command)
@@ -1426,6 +1511,7 @@ class Macro:
             "name": self.name,
             "hotkey": self.hotkey,
             "window_geometry": self.window_geometry,
+            "repeat_count": self.repeat_count,
             "commands": [cmd.to_dict() for cmd in self.commands]
         }
     
@@ -1434,6 +1520,7 @@ class Macro:
         macro = Macro(data.get("name", "Unnamed"))
         macro.hotkey = data.get("hotkey")
         macro.window_geometry = data.get("window_geometry")
+        macro.repeat_count = data.get("repeat_count", 1)
         for cmd_data in data.get("commands", []):
             cmd = MacroCommand.from_dict(cmd_data)
             if cmd:
@@ -1507,6 +1594,10 @@ class MacroExecutor:
             
             elif not isinstance(cmd, (EndIfStatementCommand, EndRepeatCommand)):
                 cmd.execute(context)
+            
+            # Add 0.25s delay between every action
+            if not self.stop_flag:
+                time.sleep(0.25)
             
             i += 1
     
@@ -1635,6 +1726,92 @@ class MacroMakerApp:
         self.load_macros()
         self.start_hotkey_listener()
     
+    def make_tabbable(self, widget):
+        """Make a widget properly tabbable with focus highlighting and keyboard activation"""
+        # Enable tab focus for the widget
+        try:
+            widget.configure(takefocus=True)
+        except:
+            pass
+        
+        # For CTkButton, we need to also set takefocus on the internal button
+        if hasattr(widget, '_button'):
+            try:
+                widget._button.configure(takefocus=True)
+            except:
+                pass
+        
+        # Add focus highlighting
+        self.add_focus_highlighting(widget)
+        
+        # For buttons, bind Space and Enter to activate
+        if isinstance(widget, ctk.CTkButton):
+            def activate_button(event):
+                widget.invoke()
+                return "break"
+            widget.bind('<space>', activate_button)
+            widget.bind('<Return>', activate_button)
+        
+        # Debug logging for focus events
+        def on_focus_debug(event):
+            print(f"[FOCUS] Widget got focus: {type(widget).__name__} - {widget.winfo_name()}")
+        widget.bind("<FocusIn>", on_focus_debug, add="+")
+    
+    def setup_dialog_tab_order(self, dialog, widgets):
+        """Set up proper tab order for a dialog"""
+        for i, widget in enumerate(widgets):
+            self.make_tabbable(widget)
+        
+        # Bind Tab and Shift-Tab to cycle through widgets
+        def on_tab(event):
+            current = dialog.focus_get()
+            print(f"[TAB] Current focus: {type(current).__name__ if current else 'None'}")
+            try:
+                idx = widgets.index(current) if current in widgets else -1
+                next_idx = (idx + 1) % len(widgets)
+                next_widget = widgets[next_idx]
+                next_widget.focus_set()
+                print(f"[TAB] Moving focus to: {type(next_widget).__name__}")
+                return "break"
+            except Exception as e:
+                print(f"[TAB] Error: {e}")
+                # Fallback: try to find widget in hierarchy
+                for widget in widgets:
+                    if current == widget or (hasattr(widget, '_entry') and current == widget._entry):
+                        idx = widgets.index(widget)
+                        next_idx = (idx + 1) % len(widgets)
+                        widgets[next_idx].focus_set()
+                        return "break"
+            return "break"
+        
+        def on_shift_tab(event):
+            current = dialog.focus_get()
+            print(f"[SHIFT-TAB] Current focus: {type(current).__name__ if current else 'None'}")
+            try:
+                idx = widgets.index(current) if current in widgets else 0
+                prev_idx = (idx - 1) % len(widgets)
+                prev_widget = widgets[prev_idx]
+                prev_widget.focus_set()
+                print(f"[SHIFT-TAB] Moving focus to: {type(prev_widget).__name__}")
+                return "break"
+            except Exception as e:
+                print(f"[SHIFT-TAB] Error: {e}")
+                for widget in widgets:
+                    if current == widget or (hasattr(widget, '_entry') and current == widget._entry):
+                        idx = widgets.index(widget)
+                        prev_idx = (idx - 1) % len(widgets)
+                        widgets[prev_idx].focus_set()
+                        return "break"
+            return "break"
+        
+        dialog.bind('<Tab>', on_tab)
+        dialog.bind('<Shift-Tab>', on_shift_tab)
+        
+        # Focus first widget
+        if widgets:
+            widgets[0].focus_set()
+            print(f"[INIT] Initial focus set to: {type(widgets[0]).__name__}")
+    
     def add_focus_highlighting(self, widget):
         """Add focus visual indicators to a widget"""
         original_border = None
@@ -1707,11 +1884,12 @@ class MacroMakerApp:
         
         ok_btn = ctk.CTkButton(btn_frame, text="OK", command=submit, width=100)
         ok_btn.pack(side=tk.LEFT, padx=5)
-        self.add_focus_highlighting(ok_btn)
         
         cancel_btn = ctk.CTkButton(btn_frame, text="Cancel", command=cancel, width=100)
         cancel_btn.pack(side=tk.LEFT, padx=5)
-        self.add_focus_highlighting(cancel_btn)
+        
+        # Set up tab navigation: entry -> ok -> cancel
+        self.setup_dialog_tab_order(dialog, [entry, ok_btn, cancel_btn])
         
         # Bind keys
         entry.bind("<Return>", submit)
@@ -1719,6 +1897,9 @@ class MacroMakerApp:
         
         # Auto-size and center dialog
         schedule_autosize(dialog)
+        
+        # Focus entry field by default
+        entry.focus_set()
         
         dialog.wait_window()
         return result["value"]
@@ -1737,6 +1918,7 @@ class MacroMakerApp:
         
         ctk.CTkLabel(top_frame, text="Repeat:").pack(side=tk.LEFT, padx=5)
         self.repeat_var = tk.StringVar(value="1")
+        self.repeat_var.trace_add("write", self._on_repeat_changed)
         self.repeat_entry = ctk.CTkEntry(top_frame, textvariable=self.repeat_var, width=80)
         self.repeat_entry.pack(side=tk.LEFT, padx=5)
         self.add_focus_highlighting(self.repeat_entry)
@@ -2011,21 +2193,43 @@ class MacroMakerApp:
     
     def highlight_command(self, index):
         """Highlight the command at the given index during execution"""
-        # Reset all frames to default color
+        print(f"[HIGHLIGHT] Highlighting command at index: {index}")
+        
+        # Reset all frames to their original color-coded colors
         for frame in self.command_frame.winfo_children():
             if hasattr(frame, '_command_index'):
-                frame.config(bg="white")
-                for child in frame.winfo_children():
-                    child.config(bg="white")
+                cmd_idx = frame._command_index
+                if cmd_idx < len(self.current_macro.commands):
+                    cmd = self.current_macro.commands[cmd_idx]
+                    cmd_class = cmd.__class__.__name__
+                    original_color = self.action_colors.get(cmd_class, self.action_colors['default'])
+                    
+                    # If this is the selected command, lighten it
+                    if cmd_idx == self.selected_index:
+                        original_color = self._lighten_color(original_color, 0.3)
+                    
+                    print(f"[HIGHLIGHT] Resetting frame {cmd_idx} to original color: {original_color}")
+                    frame.config(bg=original_color)
+                    for child in frame.winfo_children():
+                        child.config(bg=original_color)
         
         # Highlight the current command if index is valid
         if index >= 0 and 0 <= index < len(self.command_frame.winfo_children()):
             frames = self.command_frame.winfo_children()
             for frame in frames:
                 if hasattr(frame, '_command_index') and frame._command_index == index:
-                    frame.config(bg="dodgerblue")
+                    cmd = self.current_macro.commands[index]
+                    cmd_class = cmd.__class__.__name__
+                    original_color = self.action_colors.get(cmd_class, self.action_colors['default'])
+                    
+                    # Make it lighter during execution (less than selection lightening)
+                    executing_color = self._lighten_color(original_color, 0.5)
+                    
+                    print(f"[HIGHLIGHT] Setting executing command {index} to lighter color: {executing_color}")
+                    frame.config(bg=executing_color)
                     for child in frame.winfo_children():
-                        child.config(bg="dodgerblue")
+                        child.config(bg=executing_color)
+                    
                     # Scroll to make the highlighted command visible
                     self.command_canvas.update_idletasks()
                     y = frame.winfo_y()
@@ -2175,6 +2379,8 @@ class MacroMakerApp:
             return ClipboardPasteCommand()
         elif cmd_type == 'capture_screen':
             return CaptureScreenCommand(data['x1'], data['y1'], data['x2'], data['y2'])
+        elif cmd_type == 'save_clipboard_image':
+            return SaveClipboardImageCommand(data.get('filename'))
         
         return None
     
@@ -2553,16 +2759,16 @@ class MacroMakerApp:
         image_menu = tk.Menu(menu, tearoff=0, bg=menu_bg, fg=menu_fg, activebackground="#9B59B6", activeforeground=menu_fg)
         image_menu.add_command(label="IF IMAGE", underline=0, command=lambda: self.insert_command_at_selection("if_image"))
         image_menu.add_command(label="FIND IMAGE", underline=0, command=lambda: self.insert_command_at_selection("find_image"))
-        menu.add_cascade(label="Image Commands", underline=0, menu=image_menu)
+        menu.add_cascade(label="Image Commands", underline=1, menu=image_menu)
         
         # Control flow commands submenu
         flow_menu = tk.Menu(menu, tearoff=0, bg=menu_bg, fg=menu_fg, activebackground="#E67E22", activeforeground=menu_fg)
         flow_menu.add_command(label="IF Statement", underline=0, command=lambda: self.insert_command_at_selection("if_statement"))
         flow_menu.add_command(label="ELSE", underline=0, command=lambda: self.insert_command_at_selection("else"))
-        flow_menu.add_command(label="END IF", underline=4, command=lambda: self.insert_command_at_selection("end_if"))
+        flow_menu.add_command(label="END IF", underline=1, command=lambda: self.insert_command_at_selection("end_if"))
         flow_menu.add_command(label="REPEAT", underline=0, command=lambda: self.insert_command_at_selection("repeat"))
-        flow_menu.add_command(label="END REPEAT", underline=4, command=lambda: self.insert_command_at_selection("end_repeat"))
-        menu.add_cascade(label="Control Flow", underline=1, menu=flow_menu)
+        flow_menu.add_command(label="END REPEAT", underline=5, command=lambda: self.insert_command_at_selection("end_repeat"))
+        menu.add_cascade(label="Control Flow", underline=8, menu=flow_menu)
         
         # Clipboard commands submenu
         clipboard_menu = tk.Menu(menu, tearoff=0, bg=menu_bg, fg=menu_fg, activebackground="#1ABC9C", activeforeground=menu_fg)
@@ -2570,10 +2776,11 @@ class MacroMakerApp:
         clipboard_menu.add_command(label="Set", underline=0, command=lambda: self.insert_command_at_selection("clipboard_set"))
         clipboard_menu.add_command(label="Increment", underline=0, command=lambda: self.insert_command_at_selection("clipboard_increment"))
         clipboard_menu.add_command(label="cOpy", underline=1, command=lambda: self.insert_command_at_selection("clipboard_copy"))
-        clipboard_menu.add_command(label="Paste", underline=0, command=lambda: self.insert_command_at_selection("clipboard_paste"))
+        clipboard_menu.add_command(label="pAste", underline=1, command=lambda: self.insert_command_at_selection("clipboard_paste"))
         clipboard_menu.add_command(label="Edit", underline=0, command=lambda: self.insert_command_at_selection("clipboard_edit"))
-        clipboard_menu.add_command(label="capture Screen", underline=0, command=lambda: self.insert_command_at_selection("capture_screen"))
-        menu.add_cascade(label="Clipboard Commands", underline=0, menu=clipboard_menu)
+        clipboard_menu.add_command(label="capture scReen", underline=11, command=lambda: self.insert_command_at_selection("capture_screen"))
+        clipboard_menu.add_command(label="saVe Image", underline=2, command=lambda: self.insert_command_at_selection("save_clipboard_image"))
+        menu.add_cascade(label="cLipboard Commands", underline=1, menu=clipboard_menu)
         
         # Timing/Utility commands submenu
         timing_menu = tk.Menu(menu, tearoff=0, bg=menu_bg, fg=menu_fg, activebackground="#F39C12", activeforeground=menu_fg)
@@ -2641,6 +2848,8 @@ class MacroMakerApp:
             self.add_clipboard_edit(insert_index)
         elif command_type == "capture_screen":
             self.add_capture_screen(insert_index)
+        elif command_type == "save_clipboard_image":
+            self.add_save_clipboard_image(insert_index)
         elif command_type == "wait_for_window":
             self.add_wait_for_window_at_index(insert_index)
         elif command_type == "message":
@@ -2790,6 +2999,10 @@ class MacroMakerApp:
         if macro_name in self.macros:
             self.current_macro = self.macros[macro_name]
             self.update_command_list()
+            
+            # Restore repeat count for this macro
+            self.repeat_var.set(str(self.current_macro.repeat_count))
+            
             if self.current_macro.hotkey:
                 self.status_label.configure(text=f"Hotkey: {self.current_macro.hotkey}")
             else:
@@ -2801,6 +3014,17 @@ class MacroMakerApp:
                     self.root.geometry(self.current_macro.window_geometry)
                 except:
                     pass
+    
+    def _on_repeat_changed(self, *args):
+        """Save repeat count when it changes"""
+        if self.current_macro:
+            try:
+                repeat_value = int(self.repeat_var.get())
+                self.current_macro.repeat_count = repeat_value
+                self.save_macros()
+            except ValueError:
+                # Invalid number, ignore
+                pass
     
     def new_macro(self):
         """Create a new macro"""
@@ -2901,10 +3125,15 @@ class MacroMakerApp:
         btn_frame.pack(pady=10)
         ok_btn = ctk.CTkButton(btn_frame, text="OK", command=on_ok, width=80)
         ok_btn.pack(side=tk.LEFT, padx=20)
-        ctk.CTkButton(btn_frame, text="Cancel", command=on_cancel, width=80).pack(side=tk.RIGHT, padx=20)
+        cancel_btn = ctk.CTkButton(btn_frame, text="Cancel", command=on_cancel, width=80)
+        cancel_btn.pack(side=tk.RIGHT, padx=20)
         
-        # Bind Escape to cancel
+        # Set up tab navigation
+        self.setup_dialog_tab_order(dialog, [ok_btn, cancel_btn])
+        
+        # Bind Escape to cancel and Enter to OK
         dialog.bind('<Escape>', lambda e: on_cancel())
+        dialog.bind('<Return>', lambda e: on_ok())
         
         # Auto-size and center dialog
         schedule_autosize(dialog)
@@ -3065,25 +3294,26 @@ class MacroMakerApp:
         # Bind key press for type-ahead search
         combo.bind('<KeyPress>', on_key_press)
         
-        # Bind Enter to OK
-        combo.bind('<Return>', lambda e: on_ok())
-        combo.bind('<Escape>', lambda e: on_cancel())
+        # Bind Escape to cancel
+        dialog.bind('<Escape>', lambda e: on_cancel())
         
         btn_frame = ctk.CTkFrame(dialog)
         btn_frame.pack(pady=10)
         ok_btn = ctk.CTkButton(btn_frame, text="OK", command=on_ok, width=80)
         ok_btn.pack(side=tk.LEFT, padx=5)
-        ctk.CTkButton(btn_frame, text="Cancel", command=on_cancel, width=80).pack(side=tk.LEFT, padx=5)
+        cancel_btn = ctk.CTkButton(btn_frame, text="Cancel", command=on_cancel, width=80)
+        cancel_btn.pack(side=tk.LEFT, padx=5)
+        
+        # Set up tab navigation
+        self.setup_dialog_tab_order(dialog, [combo, ok_btn, cancel_btn])
+        
+        # Bind Enter on dialog to OK (but combo has its own enter handling)
+        ok_btn.bind('<Return>', lambda e: on_ok())
         
         # Auto-size and center dialog
         schedule_autosize(dialog)
         
         self.ensure_dialog_focused(dialog)
-        
-        def focus_combo():
-            combo.focus_set()
-        
-        dialog.after(80, focus_combo)
         
         dialog.wait_window()
         return result['key']
@@ -3205,7 +3435,15 @@ class MacroMakerApp:
         btn_frame.pack(pady=10)
         ok_btn = ctk.CTkButton(btn_frame, text="OK", command=on_ok, width=80)
         ok_btn.pack(side=tk.LEFT, padx=5)
-        ctk.CTkButton(btn_frame, text="Cancel", command=on_cancel, width=80).pack(side=tk.LEFT, padx=5)
+        cancel_btn = ctk.CTkButton(btn_frame, text="Cancel", command=on_cancel, width=80)
+        cancel_btn.pack(side=tk.LEFT, padx=5)
+        
+        # Set up tab navigation for buttons
+        self.setup_dialog_tab_order(dialog, [ok_btn, cancel_btn])
+        
+        # Bind keyboard shortcuts
+        dialog.bind('<Return>', lambda e: on_ok())
+        dialog.bind('<Escape>', lambda e: on_cancel())
         
         # Auto-size and center dialog
         schedule_autosize(dialog)
@@ -3446,7 +3684,16 @@ class MacroMakerApp:
         btn_frame.pack(pady=10)
         ok_btn = ctk.CTkButton(btn_frame, text="OK", command=on_ok, width=80)
         ok_btn.pack(side=tk.LEFT, padx=5)
-        ctk.CTkButton(btn_frame, text="Cancel", command=on_cancel, width=80).pack(side=tk.LEFT, padx=5)
+        cancel_btn = ctk.CTkButton(btn_frame, text="Cancel", command=on_cancel, width=80)
+        cancel_btn.pack(side=tk.LEFT, padx=5)
+        
+        # Make buttons tabbable
+        self.make_tabbable(ok_btn)
+        self.make_tabbable(cancel_btn)
+        
+        # Bind Enter and Escape
+        dialog.bind('<Return>', lambda e: on_ok())
+        dialog.bind('<Escape>', lambda e: on_cancel())
         
         # Auto-size and center dialog
         schedule_autosize(dialog)
@@ -3613,9 +3860,11 @@ class MacroMakerApp:
         offset_btn = ctk.CTkButton(btn_frame, text="Offset", command=choose_offset, width=100)
         offset_btn.pack(side=tk.LEFT, padx=5)
         
+        # Set up tab navigation
+        self.setup_dialog_tab_order(dialog, [in_place_btn, offset_btn])
+        
         # Bind keyboard shortcuts
         dialog.bind("<Return>", choose_in_place)  # Enter selects In Place (default)
-        dialog.bind("<space>", choose_in_place)   # Space selects In Place (default)
         dialog.bind("1", choose_in_place)
         dialog.bind("2", choose_offset)
         dialog.bind('<Escape>', lambda e: dialog.destroy())
@@ -3627,12 +3876,6 @@ class MacroMakerApp:
         schedule_autosize(dialog)
         
         self.ensure_dialog_focused(dialog)
-        
-        # Focus first button after window appears
-        def focus_first_button():
-            in_place_btn.focus_set()
-        
-        dialog.after(50, focus_first_button)
         
         dialog.wait_window()
         return result["mode"]
@@ -3908,18 +4151,20 @@ class MacroMakerApp:
             btn_frame.pack(pady=20)
             ok_btn = ctk.CTkButton(btn_frame, text="OK", command=save_options, width=100)
             ok_btn.pack(side=tk.LEFT, padx=5)
-            ctk.CTkButton(btn_frame, text="Cancel", command=dialog.destroy, width=100).pack(side=tk.LEFT, padx=5)
+            cancel_btn = ctk.CTkButton(btn_frame, text="Cancel", command=dialog.destroy, width=100)
+            cancel_btn.pack(side=tk.LEFT, padx=5)
             
-            # Bind Escape to cancel
+            # Set up tab navigation
+            self.setup_dialog_tab_order(dialog, [conf_entry, move_check, search_check, ok_btn, cancel_btn])
+            
+            # Bind keyboard shortcuts
+            dialog.bind('<Return>', lambda e: save_options())
             dialog.bind('<Escape>', lambda e: dialog.destroy())
             
             # Auto-size and center dialog
             schedule_autosize(dialog)
             
             self.ensure_dialog_focused(dialog)
-            
-            # Focus OK button after window appears
-            dialog.after(50, lambda: ok_btn.focus_set())
     
     def add_if_image_at_index(self, insert_index):
         """Add IF IMAGE command at specific index"""
@@ -3969,18 +4214,20 @@ class MacroMakerApp:
             btn_frame.pack(pady=20)
             ok_btn = ctk.CTkButton(btn_frame, text="OK", command=save_options, width=100)
             ok_btn.pack(side=tk.LEFT, padx=5)
-            ctk.CTkButton(btn_frame, text="Cancel", command=dialog.destroy, width=100).pack(side=tk.LEFT, padx=5)
+            cancel_btn = ctk.CTkButton(btn_frame, text="Cancel", command=dialog.destroy, width=100)
+            cancel_btn.pack(side=tk.LEFT, padx=5)
             
-            # Bind Escape to cancel
+            # Set up tab navigation
+            self.setup_dialog_tab_order(dialog, [conf_entry, move_check, ok_btn, cancel_btn])
+            
+            # Bind keyboard shortcuts
+            dialog.bind('<Return>', lambda e: save_options())
             dialog.bind('<Escape>', lambda e: dialog.destroy())
             
             # Auto-size and center dialog
             schedule_autosize(dialog)
             
             self.ensure_dialog_focused(dialog)
-            
-            # Focus OK button after window appears
-            dialog.after(50, lambda: ok_btn.focus_set())
     
     def add_find_image_at_index(self, insert_index):
         """Add FIND IMAGE command at specific index"""
@@ -4076,9 +4323,14 @@ class MacroMakerApp:
             btn_frame.pack(pady=20)
             ok_btn = ctk.CTkButton(btn_frame, text="OK", command=save_options, width=100)
             ok_btn.pack(side=tk.LEFT, padx=5)
-            ctk.CTkButton(btn_frame, text="Cancel", command=dialog.destroy, width=100).pack(side=tk.LEFT, padx=5)
+            cancel_btn = ctk.CTkButton(btn_frame, text="Cancel", command=dialog.destroy, width=100)
+            cancel_btn.pack(side=tk.LEFT, padx=5)
             
-            # Bind Escape to cancel
+            # Set up tab navigation
+            self.setup_dialog_tab_order(dialog, [conf_entry, search_check, ok_btn, cancel_btn])
+            
+            # Bind Enter and Escape
+            dialog.bind('<Return>', lambda e: save_options())
             dialog.bind('<Escape>', lambda e: dialog.destroy())
             
             # Auto-size and center dialog
@@ -4103,13 +4355,14 @@ class MacroMakerApp:
         text_var = tk.StringVar()
         text_entry = ctk.CTkEntry(dialog, textvariable=text_var, width=350)
         text_entry.pack(pady=5)
-        text_entry.focus()
         
         always_on_top_var = tk.BooleanVar(value=False)
-        ctk.CTkCheckBox(dialog, text="Always on top", variable=always_on_top_var).pack(pady=5)
+        top_check = ctk.CTkCheckBox(dialog, text="Always on top", variable=always_on_top_var)
+        top_check.pack(pady=5)
         
         always_focused_var = tk.BooleanVar(value=False)
-        ctk.CTkCheckBox(dialog, text="Always focused", variable=always_focused_var).pack(pady=5)
+        focused_check = ctk.CTkCheckBox(dialog, text="Always focused", variable=always_focused_var)
+        focused_check.pack(pady=5)
         
         def save_message():
             text = text_var.get()
@@ -4125,25 +4378,22 @@ class MacroMakerApp:
         
         btn_frame = ctk.CTkFrame(dialog)
         btn_frame.pack(pady=20)
-        ctk.CTkButton(btn_frame, text="OK", command=save_message, width=80).pack(side=tk.LEFT, padx=5)
-        ctk.CTkButton(btn_frame, text="Cancel", command=dialog.destroy, width=80).pack(side=tk.LEFT, padx=5)
+        ok_btn = ctk.CTkButton(btn_frame, text="OK", command=save_message, width=80)
+        ok_btn.pack(side=tk.LEFT, padx=5)
+        cancel_btn = ctk.CTkButton(btn_frame, text="Cancel", command=dialog.destroy, width=80)
+        cancel_btn.pack(side=tk.LEFT, padx=5)
+        
+        # Set up tab navigation
+        self.setup_dialog_tab_order(dialog, [text_entry, top_check, focused_check, ok_btn, cancel_btn])
         
         # Bind Enter key to save and Escape to cancel
-        text_entry.bind("<Return>", lambda e: save_message())
+        dialog.bind('<Return>', lambda e: save_message())
         dialog.bind('<Escape>', lambda e: dialog.destroy())
         
         # Auto-size and center dialog
         schedule_autosize(dialog)
         
         self.ensure_dialog_focused(dialog)
-        
-        # Focus text field after dialog appears
-        def focus_text():
-            text_entry.focus_set()
-            text_entry.select_range(0, tk.END)
-            text_entry.icursor(tk.END)
-        
-        dialog.after(50, focus_text)
     
     def add_repeat(self, insert_index=None):
         """Add REPEAT command"""
@@ -4268,13 +4518,14 @@ class MacroMakerApp:
         text_var = tk.StringVar()
         text_entry = ctk.CTkEntry(dialog, textvariable=text_var, width=350)
         text_entry.pack(pady=5)
-        text_entry.focus()
         
         always_on_top_var = tk.BooleanVar(value=False)
-        ctk.CTkCheckBox(dialog, text="Always on top", variable=always_on_top_var).pack(pady=5)
+        top_check = ctk.CTkCheckBox(dialog, text="Always on top", variable=always_on_top_var)
+        top_check.pack(pady=5)
         
         always_focused_var = tk.BooleanVar(value=False)
-        ctk.CTkCheckBox(dialog, text="Always focused", variable=always_focused_var).pack(pady=5)
+        focused_check = ctk.CTkCheckBox(dialog, text="Always focused", variable=always_focused_var)
+        focused_check.pack(pady=5)
         
         def save_message():
             text = text_var.get()
@@ -4290,10 +4541,16 @@ class MacroMakerApp:
         
         btn_frame = ctk.CTkFrame(dialog)
         btn_frame.pack(pady=20)
-        ctk.CTkButton(btn_frame, text="OK", command=save_message, width=80).pack(side=tk.LEFT, padx=5)
-        ctk.CTkButton(btn_frame, text="Cancel", command=dialog.destroy, width=80).pack(side=tk.LEFT, padx=5)
+        ok_btn = ctk.CTkButton(btn_frame, text="OK", command=save_message, width=80)
+        ok_btn.pack(side=tk.LEFT, padx=5)
+        cancel_btn = ctk.CTkButton(btn_frame, text="Cancel", command=dialog.destroy, width=80)
+        cancel_btn.pack(side=tk.LEFT, padx=5)
         
-        text_entry.bind("<Return>", lambda e: save_message())
+        # Set up tab navigation
+        self.setup_dialog_tab_order(dialog, [text_entry, top_check, focused_check, ok_btn, cancel_btn])
+        
+        # Bind Enter and Escape
+        dialog.bind('<Return>', lambda e: save_message())
         dialog.bind('<Escape>', lambda e: dialog.destroy())
         
         # Auto-size and center dialog
@@ -4396,6 +4653,10 @@ class MacroMakerApp:
         # Show instructions
         messagebox.showinfo("Capture Region", "Click and drag to select the screen region to capture.")
         
+        # Small delay to ensure messagebox is fully dismissed
+        time.sleep(0.3)
+        self.root.update()
+        
         # Capture the region coordinates
         result = self.capture_screen_region()
         if result:
@@ -4412,6 +4673,41 @@ class MacroMakerApp:
                     self.selected_index = len(self.current_macro.commands) - 1
                 self.update_command_list()
                 self.save_macros()
+        else:
+            messagebox.showwarning("Cancelled", "Screen capture was cancelled or region was too small.")
+    
+    def add_save_clipboard_image(self, insert_index=None):
+        """Add save clipboard image command"""
+        if not self.current_macro:
+            messagebox.showwarning("Warning", "Please select a macro first")
+            return
+        
+        # Ask if user wants to specify a filename
+        filename = self.show_input_dialog(
+            "Save Clipboard Image",
+            "Enter filename (leave blank for auto-generated):",
+            ""
+        )
+        
+        # Allow empty filename for auto-generation
+        if filename is not None:
+            # Use None for auto-generated names
+            if filename.strip() == "":
+                filename = None
+            elif not filename.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.gif')):
+                # Add .png extension if no image extension provided
+                filename = filename + ".png"
+            
+            self.save_state()
+            cmd = SaveClipboardImageCommand(filename)
+            if insert_index is not None:
+                self.current_macro.commands.insert(insert_index, cmd)
+                self.selected_index = insert_index
+            else:
+                self.current_macro.add_command(cmd)
+                self.selected_index = len(self.current_macro.commands) - 1
+            self.update_command_list()
+            self.save_macros()
     
     def add_clipboard_edit(self, insert_index=None):
         """Add clipboard edit command"""
@@ -4437,35 +4733,45 @@ class MacroMakerApp:
         btn_frame = ctk.CTkFrame(dialog)
         btn_frame.pack(pady=10, padx=20, fill=tk.BOTH, expand=True)
         
-        ctk.CTkButton(
+        remove_spaces_btn = ctk.CTkButton(
             btn_frame,
             text="Remove Spaces",
             command=lambda: select_operation("remove_spaces"),
             width=250,
             height=40
-        ).pack(pady=5)
+        )
+        remove_spaces_btn.pack(pady=5)
         
-        ctk.CTkButton(
+        remove_indents_btn = ctk.CTkButton(
             btn_frame,
             text="Remove Indents",
             command=lambda: select_operation("remove_indents"),
             width=250,
             height=40
-        ).pack(pady=5)
+        )
+        remove_indents_btn.pack(pady=5)
         
-        ctk.CTkButton(
+        proper_case_btn = ctk.CTkButton(
             btn_frame,
             text="Proper Case",
             command=lambda: select_operation("proper"),
             width=250,
             height=40
-        ).pack(pady=5)
+        )
+        proper_case_btn.pack(pady=5)
         
         def cancel():
             dialog.grab_release()
             dialog.destroy()
         
-        ctk.CTkButton(dialog, text="Cancel", command=cancel, width=100).pack(pady=10)
+        cancel_btn = ctk.CTkButton(dialog, text="Cancel", command=cancel, width=100)
+        cancel_btn.pack(pady=10)
+        
+        # Set up tab navigation
+        self.setup_dialog_tab_order(dialog, [remove_spaces_btn, remove_indents_btn, proper_case_btn, cancel_btn])
+        
+        # Bind Escape to cancel
+        dialog.bind('<Escape>', lambda e: cancel())
         
         # Auto-size and center dialog
         schedule_autosize(dialog)
@@ -4614,10 +4920,13 @@ class MacroMakerApp:
         self.status_label.configure(text="Running...")
         
         def progress_callback(index):
+            print(f"[PROGRESS] Executing command at index: {index}")
             self.root.after(0, lambda: self.highlight_command(index))
         
         def run():
+            print(f"[RUN] Starting macro execution")
             self.executor.execute(self.current_macro, repeat_count, progress_callback)
+            print(f"[RUN] Macro execution complete, resetting highlight")
             self.root.after(0, lambda: self.highlight_command(-1))  # Reset highlight
             self.root.after(0, lambda: self.status_label.configure(text="Ready"))
         
@@ -4747,6 +5056,13 @@ class MacroMakerApp:
         ok_btn = ctk.CTkButton(preview_window, text="OK", command=preview_window.destroy, width=80)
         ok_btn.pack(pady=10)
         
+        # Set up tab navigation
+        self.setup_dialog_tab_order(preview_window, [ok_btn])
+        
+        # Bind Enter and Escape
+        preview_window.bind('<Return>', lambda e: preview_window.destroy())
+        preview_window.bind('<Escape>', lambda e: preview_window.destroy())
+        
         # Auto-size and center dialog
         schedule_autosize(preview_window)
         
@@ -4754,9 +5070,6 @@ class MacroMakerApp:
         preview_window.attributes('-topmost', True)
         preview_window.focus_force()
         preview_window.lift()
-        
-        # Focus OK button after dialog appears
-        preview_window.after(50, lambda: ok_btn.focus_set())
         
         # Wait for window to close before continuing
         preview_window.wait_window()
@@ -4833,13 +5146,14 @@ class MacroMakerApp:
         text_var = tk.StringVar(value=cmd.text)
         text_entry = ctk.CTkEntry(dialog, textvariable=text_var, width=350)
         text_entry.pack(pady=5)
-        text_entry.focus()
         
         always_on_top_var = tk.BooleanVar(value=cmd.always_on_top)
-        ctk.CTkCheckBox(dialog, text="Always on top", variable=always_on_top_var).pack(pady=5)
+        top_check = ctk.CTkCheckBox(dialog, text="Always on top", variable=always_on_top_var)
+        top_check.pack(pady=5)
         
         always_focused_var = tk.BooleanVar(value=cmd.always_focused)
-        ctk.CTkCheckBox(dialog, text="Always focused", variable=always_focused_var).pack(pady=5)
+        focused_check = ctk.CTkCheckBox(dialog, text="Always focused", variable=always_focused_var)
+        focused_check.pack(pady=5)
         
         def save_changes():
             text = text_var.get()
@@ -4856,25 +5170,22 @@ class MacroMakerApp:
         
         btn_frame = ctk.CTkFrame(dialog)
         btn_frame.pack(pady=20)
-        ctk.CTkButton(btn_frame, text="OK", command=save_changes, width=80).pack(side=tk.LEFT, padx=5)
-        ctk.CTkButton(btn_frame, text="Cancel", command=dialog.destroy, width=80).pack(side=tk.LEFT, padx=5)
+        ok_btn = ctk.CTkButton(btn_frame, text="OK", command=save_changes, width=80)
+        ok_btn.pack(side=tk.LEFT, padx=5)
+        cancel_btn = ctk.CTkButton(btn_frame, text="Cancel", command=dialog.destroy, width=80)
+        cancel_btn.pack(side=tk.LEFT, padx=5)
+        
+        # Set up tab navigation
+        self.setup_dialog_tab_order(dialog, [text_entry, top_check, focused_check, ok_btn, cancel_btn])
         
         # Bind Enter key to save and Escape to cancel
-        text_entry.bind("<Return>", lambda e: save_changes())
+        dialog.bind('<Return>', lambda e: save_changes())
         dialog.bind('<Escape>', lambda e: dialog.destroy())
         
         # Auto-size and center dialog
         schedule_autosize(dialog)
         
         self.ensure_dialog_focused(dialog)
-        
-        # Focus text field after dialog appears
-        def focus_text():
-            text_entry.focus_set()
-            text_entry.select_range(0, tk.END)
-            text_entry.icursor(tk.END)
-        
-        dialog.after(80, focus_text)
     
     def edit_image_command(self, cmd, index):
         """Edit an image command with preview and multiple images support"""
@@ -5142,18 +5453,20 @@ class MacroMakerApp:
             
             save_btn = ctk.CTkButton(btn_frame, text="Save", command=save_changes, width=80)
             save_btn.pack(side=tk.LEFT, padx=5)
-            ctk.CTkButton(btn_frame, text="Cancel", command=cancel_dialog, width=80).pack(side=tk.LEFT, padx=5)
+            cancel_btn = ctk.CTkButton(btn_frame, text="Cancel", command=cancel_dialog, width=80)
+            cancel_btn.pack(side=tk.LEFT, padx=5)
             
-            # Bind Escape to cancel
+            # Set up tab navigation
+            self.setup_dialog_tab_order(dialog, [move_check, save_btn, cancel_btn])
+            
+            # Bind Enter and Escape
+            dialog.bind('<Return>', lambda e: save_changes())
             dialog.bind('<Escape>', lambda e: cancel_dialog())
             
             # Auto-size and center dialog
             schedule_autosize(dialog)
             
             self.ensure_dialog_focused(dialog)
-            
-            # Focus save button after dialog appears
-            dialog.after(50, lambda: save_btn.focus_set())
         
         else:
             # FIND IMAGE command - single image only
@@ -5219,8 +5532,22 @@ class MacroMakerApp:
                 dialog.destroy()
             
             ctk.CTkButton(btn_frame, text="Recapture Image", command=recapture, width=120).pack(side=tk.LEFT, padx=5)
-            ctk.CTkButton(btn_frame, text="Save", command=save_changes, width=80).pack(side=tk.LEFT, padx=5)
-            ctk.CTkButton(btn_frame, text="Cancel", command=cancel_dialog, width=80).pack(side=tk.LEFT, padx=5)
+            save_btn = ctk.CTkButton(btn_frame, text="Save", command=save_changes, width=80)
+            save_btn.pack(side=tk.LEFT, padx=5)
+            cancel_btn = ctk.CTkButton(btn_frame, text="Cancel", command=cancel_dialog, width=80)
+            cancel_btn.pack(side=tk.LEFT, padx=5)
+            
+            # Set up tab navigation
+            self.setup_dialog_tab_order(dialog, [conf_entry, save_btn, cancel_btn])
+            
+            # Bind Enter and Escape
+            dialog.bind('<Return>', lambda e: save_changes())
+            dialog.bind('<Escape>', lambda e: cancel_dialog())
+            
+            # Auto-size and center dialog
+            schedule_autosize(dialog)
+            
+            self.ensure_dialog_focused(dialog)
     
     def set_window_position(self):
         """Save current window position and size for the current macro"""
