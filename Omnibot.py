@@ -510,6 +510,8 @@ class MacroCommand:
             return DelayMsCommand(data.get("milliseconds", 100))
         elif cmd_type == "wait_for_window":
             return WaitForWindowCommand(data.get("window_pattern", "*"), data.get("timeout", 30))
+        elif cmd_type == "focus_window":
+            return FocusWindowCommand(data.get("window_pattern", "*"))
         elif cmd_type == "message":
             return MessageCommand(
                 data.get("text", ""),
@@ -984,6 +986,54 @@ class WaitForWindowCommand(MacroCommand):
         return f"WAIT FOR WINDOW: {self.window_pattern} (timeout: {self.timeout}s)"
 
 
+class FocusWindowCommand(MacroCommand):
+    def __init__(self, window_pattern):
+        super().__init__("focus_window")
+        self.window_pattern = window_pattern
+    
+    def execute(self, context):
+        import re
+        # Convert wildcard pattern to regex
+        pattern = self.window_pattern.replace('*', '.*')
+        regex = re.compile(pattern, re.IGNORECASE)
+        
+        user32 = ctypes.windll.user32
+        EnumWindows = user32.EnumWindows
+        EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int))
+        GetWindowText = user32.GetWindowTextW
+        GetWindowTextLength = user32.GetWindowTextLengthW
+        IsWindowVisible = user32.IsWindowVisible
+        SetForegroundWindow = user32.SetForegroundWindow
+        
+        target_hwnd = None
+        
+        def check_window(hwnd, lParam):
+            nonlocal target_hwnd
+            if IsWindowVisible(hwnd):
+                length = GetWindowTextLength(hwnd)
+                buff = ctypes.create_unicode_buffer(length + 1)
+                GetWindowText(hwnd, buff, length + 1)
+                if buff.value and regex.search(buff.value):
+                    target_hwnd = hwnd
+                    return False  # Stop enumeration
+            return True  # Continue enumeration
+        
+        # Find matching window
+        EnumWindows(EnumWindowsProc(check_window), 0)
+        
+        if target_hwnd:
+            # Focus the window
+            SetForegroundWindow(target_hwnd)
+        else:
+            raise ValueError(f"Window matching '{self.window_pattern}' not found")
+    
+    def to_dict(self):
+        return {"type": self.command_type, "window_pattern": self.window_pattern}
+    
+    def __str__(self):
+        return f"FOCUS WINDOW: {self.window_pattern}"
+
+
 class MessageCommand(MacroCommand):
     def __init__(self, text, always_on_top=False, always_focused=False):
         super().__init__("message")
@@ -1311,8 +1361,11 @@ class CaptureScreenCommand(MacroCommand):
         import io
         import win32clipboard
         
+        print(f"[CAPTURE_SCREEN] Capturing region ({self.x1}, {self.y1}) to ({self.x2}, {self.y2})")
+        
         # Capture the specified region
         screenshot = ImageGrab.grab(bbox=(self.x1, self.y1, self.x2, self.y2))
+        print(f"[CAPTURE_SCREEN] Screenshot captured: {screenshot.size}")
         
         # Convert to BMP format for clipboard
         output = io.BytesIO()
@@ -1325,6 +1378,7 @@ class CaptureScreenCommand(MacroCommand):
         win32clipboard.EmptyClipboard()
         win32clipboard.SetClipboardData(win32clipboard.CF_DIB, data)
         win32clipboard.CloseClipboard()
+        print(f"[CAPTURE_SCREEN] Image copied to clipboard ({len(data)} bytes)")
     
     def to_dict(self):
         return {
@@ -1384,18 +1438,29 @@ class SaveClipboardImageCommand(MacroCommand):
                 # Get desktop path
                 desktop = os.path.join(os.path.expanduser("~"), "Desktop")
                 
-                # Generate filename if not provided
+                # Always generate unique timestamped filename
+                import datetime
+                timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                
+                # Use custom base name if provided, otherwise use "clipboard_image"
                 if self.filename:
-                    filepath = os.path.join(desktop, self.filename)
+                    # Strip extension from filename to use as base
+                    import os.path
+                    base_name = os.path.splitext(self.filename)[0]
+                    # Remove any existing timestamp pattern if present
+                    if '_' in base_name and len(base_name.split('_')[-1]) >= 6:
+                        parts = base_name.rsplit('_', 1)
+                        if parts[-1].isdigit():
+                            base_name = parts[0]
+                    filepath = os.path.join(desktop, f"{base_name}_{timestamp}.png")
                 else:
-                    # Generate timestamped filename with microseconds for uniqueness
-                    import datetime
-                    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
                     filepath = os.path.join(desktop, f"clipboard_image_{timestamp}.png")
+                
+                print(f"[SAVE_CLIPBOARD] Saving image with unique name: {filepath}")
                 
                 # Save the image
                 image.save(filepath)
-                print(f"Image saved to: {filepath}")
+                print(f"[SAVE_CLIPBOARD] Image saved to: {filepath}")
                 
             except Exception as e:
                 try:
@@ -1762,50 +1827,87 @@ class MacroMakerApp:
         for i, widget in enumerate(widgets):
             self.make_tabbable(widget)
         
+        def find_parent_widget(current):
+            """Find the parent widget in widgets list if current is an internal widget"""
+            for widget in widgets:
+                if current == widget:
+                    return widget
+                # Check for CTkEntry's internal entry
+                if hasattr(widget, '_entry') and current == widget._entry:
+                    return widget
+                # Check for CTkButton's internal widgets (canvas, text_label)
+                if hasattr(widget, '_canvas') and current == widget._canvas:
+                    return widget
+                if hasattr(widget, '_text_label') and current == widget._text_label:
+                    return widget
+                # Check if current is a child of the widget
+                try:
+                    if current.winfo_parent() == str(widget):
+                        return widget
+                    # Check one more level up (for nested internal widgets)
+                    parent = current.master
+                    if parent == widget:
+                        return widget
+                except:
+                    pass
+            return None
+        
         # Bind Tab and Shift-Tab to cycle through widgets
         def on_tab(event):
             current = dialog.focus_get()
             print(f"[TAB] Current focus: {type(current).__name__ if current else 'None'}")
-            try:
-                idx = widgets.index(current) if current in widgets else -1
+            
+            # Find the actual widget in our list
+            actual_widget = find_parent_widget(current)
+            if actual_widget:
+                idx = widgets.index(actual_widget)
                 next_idx = (idx + 1) % len(widgets)
                 next_widget = widgets[next_idx]
                 next_widget.focus_set()
                 print(f"[TAB] Moving focus to: {type(next_widget).__name__}")
-                return "break"
-            except Exception as e:
-                print(f"[TAB] Error: {e}")
-                # Fallback: try to find widget in hierarchy
-                for widget in widgets:
-                    if current == widget or (hasattr(widget, '_entry') and current == widget._entry):
-                        idx = widgets.index(widget)
-                        next_idx = (idx + 1) % len(widgets)
-                        widgets[next_idx].focus_set()
-                        return "break"
+            else:
+                # Default to first widget
+                if widgets:
+                    widgets[0].focus_set()
+                    print(f"[TAB] Defaulting focus to: {type(widgets[0]).__name__}")
             return "break"
         
         def on_shift_tab(event):
             current = dialog.focus_get()
             print(f"[SHIFT-TAB] Current focus: {type(current).__name__ if current else 'None'}")
-            try:
-                idx = widgets.index(current) if current in widgets else 0
+            
+            # Find the actual widget in our list
+            actual_widget = find_parent_widget(current)
+            if actual_widget:
+                idx = widgets.index(actual_widget)
                 prev_idx = (idx - 1) % len(widgets)
                 prev_widget = widgets[prev_idx]
                 prev_widget.focus_set()
                 print(f"[SHIFT-TAB] Moving focus to: {type(prev_widget).__name__}")
-                return "break"
-            except Exception as e:
-                print(f"[SHIFT-TAB] Error: {e}")
-                for widget in widgets:
-                    if current == widget or (hasattr(widget, '_entry') and current == widget._entry):
-                        idx = widgets.index(widget)
-                        prev_idx = (idx - 1) % len(widgets)
-                        widgets[prev_idx].focus_set()
-                        return "break"
+            else:
+                # Default to last widget
+                if widgets:
+                    widgets[-1].focus_set()
+                    print(f"[SHIFT-TAB] Defaulting focus to: {type(widgets[-1]).__name__}")
             return "break"
         
+        # Bind at dialog level
         dialog.bind('<Tab>', on_tab)
         dialog.bind('<Shift-Tab>', on_shift_tab)
+        
+        # Also bind to internal widgets of CTkEntry, CTkComboBox, and CTkButton
+        for widget in widgets:
+            # Bind to CTkEntry/CTkComboBox internal entry
+            if hasattr(widget, '_entry') and widget._entry:
+                widget._entry.bind('<Tab>', on_tab)
+                widget._entry.bind('<Shift-Tab>', on_shift_tab)
+            # Bind to CTkButton internal widgets (canvas, text_label)
+            if hasattr(widget, '_canvas') and widget._canvas:
+                widget._canvas.bind('<Tab>', on_tab)
+                widget._canvas.bind('<Shift-Tab>', on_shift_tab)
+            if hasattr(widget, '_text_label') and widget._text_label:
+                widget._text_label.bind('<Tab>', on_tab)
+                widget._text_label.bind('<Shift-Tab>', on_shift_tab)
         
         # Focus first widget
         if widgets:
@@ -1815,29 +1917,110 @@ class MacroMakerApp:
     def add_focus_highlighting(self, widget):
         """Add focus visual indicators to a widget"""
         original_border = None
+        original_fg_color = None
+        
+        def lighten_color(hex_color, factor=0.3):
+            """Lighten a hex color by a factor (0-1)"""
+            try:
+                # Remove # if present
+                hex_color = hex_color.lstrip('#')
+                # Convert to RGB
+                r = int(hex_color[0:2], 16)
+                g = int(hex_color[2:4], 16)
+                b = int(hex_color[4:6], 16)
+                # Lighten by moving towards white
+                r = int(r + (255 - r) * factor)
+                g = int(g + (255 - g) * factor)
+                b = int(b + (255 - b) * factor)
+                # Clamp values
+                r = min(255, max(0, r))
+                g = min(255, max(0, g))
+                b = min(255, max(0, b))
+                return f"#{r:02x}{g:02x}{b:02x}"
+            except:
+                return hex_color
+        
+        def get_widget_info(w):
+            """Get detailed widget information for logging"""
+            widget_type = type(w).__name__
+            widget_name = w.winfo_name() if hasattr(w, 'winfo_name') else 'unknown'
+            try:
+                parent = w.master
+                parent_type = type(parent).__name__ if parent else 'None'
+                parent_name = parent.winfo_name() if parent and hasattr(parent, 'winfo_name') else 'unknown'
+            except:
+                parent_type = 'None'
+                parent_name = 'unknown'
+            return f"{widget_type}(name={widget_name}, parent={parent_type}:{parent_name})"
         
         def on_focus_in(event):
-            nonlocal original_border
+            nonlocal original_border, original_fg_color
+            print(f"[FOCUS_IN] {get_widget_info(widget)}")
             try:
-                if hasattr(widget, 'cget'):
+                # For CTkButton, change the fg_color to a lighter shade
+                if isinstance(widget, ctk.CTkButton):
                     try:
-                        original_border = widget.cget('border_color')
-                    except:
-                        original_border = self.default_border_color
-                if hasattr(widget, 'configure'):
-                    widget.configure(border_color=self.focus_color)
+                        original_fg_color = widget.cget('fg_color')
+                        print(f"[COLOR_DEBUG] Original color: {original_fg_color}, type: {type(original_fg_color)}")
+                        if isinstance(original_fg_color, tuple):
+                            # Handle tuple (light mode, dark mode)
+                            light_color = lighten_color(original_fg_color[0])
+                            dark_color = lighten_color(original_fg_color[1])
+                            new_color = (light_color, dark_color)
+                            print(f"[COLOR_DEBUG] Lightened tuple: {new_color}")
+                            widget.configure(fg_color=new_color)
+                        else:
+                            # Single color
+                            lighter = lighten_color(original_fg_color)
+                            print(f"[COLOR_DEBUG] Lightened single: {lighter}")
+                            widget.configure(fg_color=lighter)
+                    except Exception as e:
+                        print(f"[COLOR_DEBUG] Error changing button color: {e}")
+                else:
+                    # For other widgets, use border highlighting
+                    if hasattr(widget, 'cget'):
+                        try:
+                            original_border = widget.cget('border_color')
+                        except:
+                            original_border = self.default_border_color
+                    if hasattr(widget, 'configure'):
+                        widget.configure(border_color=self.focus_color)
+            except Exception as e:
+                print(f"[FOCUS_IN] Error: {e}")
+        
+        def on_focus_out(event):
+            nonlocal original_fg_color
+            print(f"[FOCUS_OUT] {get_widget_info(widget)}")
+            try:
+                # For CTkButton, restore original fg_color
+                if isinstance(widget, ctk.CTkButton) and original_fg_color:
+                    widget.configure(fg_color=original_fg_color)
+                else:
+                    # For other widgets, restore border
+                    if hasattr(widget, 'configure'):
+                        widget.configure(border_color=original_border or self.default_border_color)
             except:
                 pass
         
-        def on_focus_out(event):
-            try:
-                if hasattr(widget, 'configure'):
-                    widget.configure(border_color=original_border or self.default_border_color)
-            except:
-                pass
+        def on_click(event):
+            print(f"[CLICK] {get_widget_info(widget)} at ({event.x}, {event.y})")
+        
+        def on_key_press(event):
+            key_info = f"key={event.keysym}" if hasattr(event, 'keysym') else f"char={event.char}"
+            print(f"[KEY_PRESS] {get_widget_info(widget)} {key_info}")
+        
+        def on_enter(event):
+            print(f"[MOUSE_ENTER] {get_widget_info(widget)}")
+        
+        def on_leave(event):
+            print(f"[MOUSE_LEAVE] {get_widget_info(widget)}")
         
         widget.bind("<FocusIn>", on_focus_in, add="+")
         widget.bind("<FocusOut>", on_focus_out, add="+")
+        widget.bind("<Button-1>", on_click, add="+")
+        widget.bind("<KeyPress>", on_key_press, add="+")
+        widget.bind("<Enter>", on_enter, add="+")
+        widget.bind("<Leave>", on_leave, add="+")
     
     def show_input_dialog(self, title, prompt, initial_value="", input_type="string"):
         """Show a styled input dialog that replaces simpledialog"""
@@ -2086,9 +2269,13 @@ class MacroMakerApp:
         btn_frame4 = ctk.CTkFrame(middle_frame)
         btn_frame4.pack(fill=tk.X, padx=10, pady=2)
         
-        btn_wait = ctk.CTkButton(btn_frame4, text="Wait For Window", command=self.add_wait_for_window, width=130, fg_color="#D4AC0D")
+        btn_wait = ctk.CTkButton(btn_frame4, text="Wait For Window", command=self.add_wait_for_window, width=120, fg_color="#D4AC0D")
         btn_wait.pack(side=tk.LEFT, padx=2)
         self.add_focus_highlighting(btn_wait)
+        
+        btn_focus = ctk.CTkButton(btn_frame4, text="Focus Window", command=self.add_focus_window, width=110, fg_color="#F39C12")
+        btn_focus.pack(side=tk.LEFT, padx=2)
+        self.add_focus_highlighting(btn_focus)
         
         btn_remove = ctk.CTkButton(btn_frame4, text="Remove Selected", command=self.remove_command, width=130, fg_color="#E74C3C")
         btn_remove.pack(side=tk.LEFT, padx=2)
@@ -2361,6 +2548,8 @@ class MacroMakerApp:
             return DelayMsCommand(data.get('milliseconds', 100))
         elif cmd_type == 'wait_for_window':
             return WaitForWindowCommand(data.get('window_pattern', '*'), data.get('timeout', 30))
+        elif cmd_type == 'focus_window':
+            return FocusWindowCommand(data.get('window_pattern', '*'))
         elif cmd_type == 'sound':
             cmd = SoundCommand(data.get('sound_type', 'beep'))
             cmd.custom_sound = data.get('custom_sound')
@@ -2852,6 +3041,8 @@ class MacroMakerApp:
             self.add_save_clipboard_image(insert_index)
         elif command_type == "wait_for_window":
             self.add_wait_for_window_at_index(insert_index)
+        elif command_type == "focus_window":
+            self.add_focus_window_at_index(insert_index)
         elif command_type == "message":
             self.add_message_at_index(insert_index)
         elif command_type in command_map:
@@ -3076,6 +3267,15 @@ class MacroMakerApp:
             messagebox.showwarning("Warning", "Please select a macro first")
             return
         
+        # Temporarily unregister all hotkeys to prevent activation during recording
+        temp_disabled_hotkeys = {}
+        for hotkey, handler in list(self.hotkey_handlers.items()):
+            try:
+                keyboard.remove_hotkey(handler)
+                temp_disabled_hotkeys[hotkey] = handler
+            except:
+                pass
+        
         # Create dialog to capture hotkey
         dialog = ctk.CTkToplevel(self.root)
         dialog.title("Set Hotkey")
@@ -3091,18 +3291,42 @@ class MacroMakerApp:
         
         def on_key(event):
             key = event.name
+            # Don't capture Enter or Escape as part of the hotkey
+            if key in ['enter', 'return', 'esc', 'escape']:
+                return
             if key not in captured_keys:
                 captured_keys.append(key)
                 hotkey_label.configure(text=" + ".join(captured_keys))
         
         keyboard.hook(on_key)
         
+        def restore_hotkeys():
+            """Restore all temporarily disabled hotkeys"""
+            keyboard.unhook_all()
+            # Re-register all macros' hotkeys
+            for macro in self.macros:
+                if macro.hotkey:
+                    self.register_hotkey(macro)
+        
         def on_ok():
             keyboard.unhook_all()
             if captured_keys:
                 hotkey = "+".join(captured_keys)
                 
-                # Remove old hotkey
+                # Check if this hotkey is already assigned to another macro
+                for macro in self.macros:
+                    if macro != self.current_macro and macro.hotkey == hotkey:
+                        # Remove from the other macro
+                        macro.hotkey = None
+                        if hotkey in self.hotkey_handlers:
+                            try:
+                                keyboard.remove_hotkey(self.hotkey_handlers[hotkey])
+                                del self.hotkey_handlers[hotkey]
+                            except:
+                                pass
+                        break
+                
+                # Remove old hotkey from current macro
                 if self.current_macro.hotkey and self.current_macro.hotkey in self.hotkey_handlers:
                     try:
                         keyboard.remove_hotkey(self.hotkey_handlers[self.current_macro.hotkey])
@@ -3112,13 +3336,14 @@ class MacroMakerApp:
                 
                 # Set new hotkey
                 self.current_macro.hotkey = hotkey
-                self.register_hotkey(self.current_macro)
                 self.save_macros()
                 self.status_label.configure(text=f"Hotkey set: {hotkey}")
+            
+            restore_hotkeys()
             dialog.destroy()
         
         def on_cancel():
-            keyboard.unhook_all()
+            restore_hotkeys()
             dialog.destroy()
         
         btn_frame = ctk.CTkFrame(dialog)
@@ -3633,11 +3858,17 @@ class MacroMakerApp:
             _, _, _, first_combo = row_frames[0]
             dialog.after(100, lambda: first_combo.focus_set())
         
+        # Placeholder for tab binding function (defined later after buttons created)
+        tab_binder = {'func': None}
+        
         # Add key button
         def add_and_focus():
             add_sequence_row()
             if row_frames:
                 _, _, _, last_combo = row_frames[-1]
+                # Bind tab events to the new combo
+                if tab_binder['func']:
+                    tab_binder['func'](last_combo)
                 last_combo.focus_set()
         
         ctk.CTkButton(dialog, text="Add Key", command=add_and_focus, width=100).pack(pady=5)
@@ -3690,6 +3921,89 @@ class MacroMakerApp:
         # Make buttons tabbable
         self.make_tabbable(ok_btn)
         self.make_tabbable(cancel_btn)
+        
+        # Custom tab handling for this dialog with dynamic comboboxes
+        def get_tab_widgets():
+            """Get current list of tabbable widgets in order"""
+            widgets = []
+            for _, _, _, key_combo in row_frames:
+                widgets.append(key_combo)
+            widgets.extend([ok_btn, cancel_btn])
+            return widgets
+        
+        def find_parent_combo(widget):
+            """Find the parent CTkComboBox if widget is the internal entry"""
+            for _, _, _, key_combo in row_frames:
+                if hasattr(key_combo, '_entry') and widget == key_combo._entry:
+                    return key_combo
+            return None
+        
+        def on_dialog_tab(event):
+            current = dialog.focus_get()
+            widgets = get_tab_widgets()
+            print(f"[TAB] Current focus: {type(current).__name__ if current else 'None'}")
+            
+            # Check if current is an internal entry of a combobox
+            parent_combo = find_parent_combo(current)
+            if parent_combo:
+                current = parent_combo
+            
+            try:
+                if current in widgets:
+                    idx = widgets.index(current)
+                    next_idx = (idx + 1) % len(widgets)
+                    next_widget = widgets[next_idx]
+                    next_widget.focus_set()
+                    print(f"[TAB] Moving focus to: {type(next_widget).__name__}")
+                else:
+                    # Default to first widget
+                    if widgets:
+                        widgets[0].focus_set()
+            except Exception as e:
+                print(f"[TAB] Error: {e}")
+            return "break"
+        
+        def on_dialog_shift_tab(event):
+            current = dialog.focus_get()
+            widgets = get_tab_widgets()
+            print(f"[SHIFT-TAB] Current focus: {type(current).__name__ if current else 'None'}")
+            
+            # Check if current is an internal entry of a combobox
+            parent_combo = find_parent_combo(current)
+            if parent_combo:
+                current = parent_combo
+            
+            try:
+                if current in widgets:
+                    idx = widgets.index(current)
+                    prev_idx = (idx - 1) % len(widgets)
+                    prev_widget = widgets[prev_idx]
+                    prev_widget.focus_set()
+                    print(f"[SHIFT-TAB] Moving focus to: {type(prev_widget).__name__}")
+                else:
+                    # Default to last widget
+                    if widgets:
+                        widgets[-1].focus_set()
+            except Exception as e:
+                print(f"[SHIFT-TAB] Error: {e}")
+            return "break"
+        
+        # Bind tab handling at dialog level
+        dialog.bind('<Tab>', on_dialog_tab)
+        dialog.bind('<Shift-Tab>', on_dialog_shift_tab)
+        
+        # Also bind to each combo's internal entry when created
+        def bind_combo_tab(key_combo):
+            if hasattr(key_combo, '_entry'):
+                key_combo._entry.bind('<Tab>', on_dialog_tab)
+                key_combo._entry.bind('<Shift-Tab>', on_dialog_shift_tab)
+        
+        # Set the tab binder so add_and_focus can use it
+        tab_binder['func'] = bind_combo_tab
+        
+        # Bind to existing combos
+        for _, _, _, key_combo in row_frames:
+            bind_combo_tab(key_combo)
         
         # Bind Enter and Escape
         dialog.bind('<Return>', lambda e: on_ok())
@@ -4500,6 +4814,34 @@ class MacroMakerApp:
                 self.selected_index = insert_index
                 self.update_command_list()
                 self.save_macros()
+    
+    def add_focus_window(self):
+        """Add focus window command"""
+        if not self.current_macro:
+            messagebox.showwarning("Warning", "Please select a macro first")
+            return
+        
+        pattern = self.show_input_dialog("Focus Window", "Enter window title pattern (use * as wildcard):")
+        if pattern:
+            self.save_state()
+            self.current_macro.add_command(FocusWindowCommand(pattern))
+            self.selected_index = len(self.current_macro.commands) - 1
+            self.update_command_list()
+            self.save_macros()
+    
+    def add_focus_window_at_index(self, insert_index):
+        """Add focus window command at specific index"""
+        if not self.current_macro:
+            messagebox.showwarning("Warning", "Please select a macro first")
+            return
+        
+        pattern = self.show_input_dialog("Focus Window", "Enter window title pattern (use * as wildcard):")
+        if pattern:
+            self.save_state()
+            self.current_macro.commands.insert(insert_index, FocusWindowCommand(pattern))
+            self.selected_index = insert_index
+            self.update_command_list()
+            self.save_macros()
     
     def add_message_at_index(self, insert_index):
         """Add message command at specific index"""
