@@ -1,5 +1,6 @@
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
+import customtkinter as ctk
 import json
 import os
 import threading
@@ -46,6 +47,63 @@ def set_dpi_awareness():
 
 # Call DPI awareness at module load time
 set_dpi_awareness()
+
+# ============================================================================
+# WINDOW AUTO-SIZING HELPER
+# ============================================================================
+
+def autosize_to_content(win, pad=(24, 24), max_ratio=0.90, center=True, min_size=None):
+    """
+    Automatically size a window to fit its content while respecting screen limits.
+    
+    Args:
+        win: The window (CTk, CTkToplevel, or Tk/Toplevel) to resize
+        pad: Tuple of (horizontal, vertical) padding to add around content
+        max_ratio: Maximum ratio of screen size the window can occupy (0.0-1.0)
+        center: Whether to center the window on screen
+        min_size: Optional tuple of (min_width, min_height) to enforce
+    """
+    try:
+        # Ensure geometry calculations are up to date
+        win.update_idletasks()
+        
+        # Get requested size (what the window needs to fit content)
+        req_w = win.winfo_reqwidth() + pad[0] * 2
+        req_h = win.winfo_reqheight() + pad[1] * 2
+        
+        # Apply minimum size if specified
+        if min_size:
+            req_w = max(req_w, min_size[0])
+            req_h = max(req_h, min_size[1])
+        
+        # Get screen dimensions
+        screen_w = win.winfo_screenwidth()
+        screen_h = win.winfo_screenheight()
+        
+        # Calculate maximum allowed size
+        max_w = int(screen_w * max_ratio)
+        max_h = int(screen_h * max_ratio)
+        
+        # Clamp to maximum
+        final_w = min(req_w, max_w)
+        final_h = min(req_h, max_h)
+        
+        if center:
+            x = (screen_w - final_w) // 2
+            y = (screen_h - final_h) // 2
+            win.geometry(f"{final_w}x{final_h}+{x}+{y}")
+        else:
+            win.geometry(f"{final_w}x{final_h}")
+        
+        # Set a sensible minimum so shrinking doesn't instantly clip
+        win.minsize(min(req_w, max_w), min(req_h, max_h))
+        
+    except Exception as e:
+        print(f"[autosize] Error sizing window: {e}")
+
+def schedule_autosize(win, **kwargs):
+    """Schedule autosize to run after widgets are fully created."""
+    win.after(0, lambda: autosize_to_content(win, **kwargs))
 
 # ============================================================================
 # IMAGE MATCHING HELPER FUNCTIONS
@@ -321,17 +379,20 @@ def find_image_cv2(template_path, confidence, search_region=None):
         return False, 0, 0, None
 
 def find_image_with_verification(image_path, confidence, move_to_image, search_region=None, 
-                                  max_attempts=5, verify_tolerance=0.6):
+                                  max_attempts=1, verify_tolerance=0.6):
     """
-    Find image with verification and retry logic.
+    Find image on screen and optionally move cursor to it.
+    
+    Simplified version that finds the first match and immediately returns,
+    without complex verification that can cause flickering between multiple matches.
     
     Args:
         image_path: Path to template image
         confidence: Confidence threshold for initial match
         move_to_image: Whether to move cursor to the found location
         search_region: Optional (x1,y1,x2,y2) or (left,top,w,h) region to search
-        max_attempts: Maximum retry attempts
-        verify_tolerance: Minimum similarity for verification
+        max_attempts: Maximum retry attempts (default 1 for immediate response)
+        verify_tolerance: Minimum similarity for verification (unused in fast mode)
     
     Returns:
         (found: bool, final_center: tuple or None)
@@ -351,100 +412,36 @@ def find_image_with_verification(image_path, confidence, move_to_image, search_r
         sx, sy = get_dpi_scale_factor()
         print(f"[Find] DPI scale: ({sx:.2f}, {sy:.2f})")
     
-    best_score = 0.0
-    best_center = None
-    
-    for attempt in range(1, max_attempts + 1):
-        if DEBUG_IMAGE:
-            print(f"[Find] Attempt {attempt}/{max_attempts}")
-        
-        # Try pyautogui first
-        try:
-            if region:
-                location = pyautogui.locateOnScreen(image_path, confidence=confidence, region=region)
-            else:
-                location = pyautogui.locateOnScreen(image_path, confidence=confidence)
-        except Exception as e:
-            print(f"[Find] pyautogui error: {e}")
-            location = None
-        
-        # If pyautogui failed, try cv2 method
-        if location is None:
-            found, cx, cy, match_rect = find_image_cv2(image_path, confidence, search_region)
-            if found:
-                location = match_rect  # Use as pseudo-location
-            else:
-                if DEBUG_IMAGE:
-                    print(f"[Find] No candidate found on attempt {attempt}")
-                continue
+    # Try pyautogui first - it finds the first match
+    try:
+        if region:
+            location = pyautogui.locateOnScreen(image_path, confidence=confidence, region=region)
         else:
-            cx, cy = pyautogui.center(location)
-            cx, cy = int(cx), int(cy)
-        
-        if DEBUG_IMAGE:
-            print(f"[Find] Candidate center: ({cx}, {cy})")
-            print(f"[Find] Location box: {location}")
-        
-        # Move cursor if requested
-        if move_to_image:
-            pyautogui.moveTo(cx, cy)
-            time.sleep(0.05)  # Small delay for cursor to settle
-            
-            # Get actual cursor position
-            actual_x, actual_y = pyautogui.position()
+            location = pyautogui.locateOnScreen(image_path, confidence=confidence)
+    except Exception as e:
+        print(f"[Find] pyautogui error: {e}")
+        location = None
+    
+    # If pyautogui failed, try cv2 method
+    if location is None:
+        found, cx, cy, match_rect = find_image_cv2(image_path, confidence, search_region)
+        if not found:
             if DEBUG_IMAGE:
-                print(f"[Find] Cursor after moveTo: ({actual_x}, {actual_y})")
-                if abs(actual_x - cx) > 2 or abs(actual_y - cy) > 2:
-                    print(f"[Find] WARNING: Cursor drift detected! Expected ({cx},{cy}), got ({actual_x},{actual_y})")
-        
-        # Verify the match
-        verified, score, patch = verify_cursor_over_template(cx, cy, image_path, verify_tolerance)
-        
-        if DEBUG_IMAGE:
-            save_debug_artifacts(image_path, template, patch, cx, cy, location, score, attempt)
-        
-        if score > best_score:
-            best_score = score
-            best_center = (cx, cy)
-        
-        if verified:
-            print(f"[Find] SUCCESS: Verified match at ({cx},{cy}) with score {score:.3f}")
-            return True, (cx, cy)
-        else:
-            print(f"[Find] Verification failed: score={score:.3f} < tolerance={verify_tolerance}")
-            
-            # Try local refinement if we have a candidate
-            if score > 0.3 and attempt < max_attempts:
-                # Search in neighborhood around current position
-                refined_found, ref_cx, ref_cy, _ = find_image_cv2(
-                    image_path, confidence * 0.9, 
-                    search_region=(cx - 100, cy - 100, cx + 100, cy + 100)
-                )
-                if refined_found:
-                    if DEBUG_IMAGE:
-                        print(f"[Find] Refinement found better position: ({ref_cx}, {ref_cy})")
-                    cx, cy = ref_cx, ref_cy
-                    
-                    if move_to_image:
-                        pyautogui.moveTo(cx, cy)
-                        time.sleep(0.05)
-                    
-                    verified2, score2, patch2 = verify_cursor_over_template(cx, cy, image_path, verify_tolerance)
-                    if verified2:
-                        print(f"[Find] SUCCESS after refinement: ({cx},{cy}) score={score2:.3f}")
-                        return True, (cx, cy)
+                print(f"[Find] No match found")
+            return False, None
+    else:
+        cx, cy = pyautogui.center(location)
+        cx, cy = int(cx), int(cy)
     
-    # Exhausted attempts
-    print(f"[Find] FAILED after {max_attempts} attempts. Best score: {best_score:.3f} at {best_center}")
+    if DEBUG_IMAGE:
+        print(f"[Find] Found match at center: ({cx}, {cy})")
     
-    # If we got close, return best position anyway (for backwards compatibility)
-    if best_score > verify_tolerance * 0.8 and best_center:
-        print(f"[Find] Returning best candidate despite not fully verified")
-        if move_to_image:
-            pyautogui.moveTo(best_center[0], best_center[1])
-        return True, best_center
+    # Move cursor if requested - do it once and immediately return
+    if move_to_image:
+        pyautogui.moveTo(cx, cy)
     
-    return False, None
+    print(f"[Find] SUCCESS: Found image at ({cx},{cy})")
+    return True, (cx, cy)
 
 
 class MacroCommand:
@@ -533,6 +530,8 @@ class MacroCommand:
             return ClipboardCopyCommand()
         elif cmd_type == "clipboard_paste":
             return ClipboardPasteCommand()
+        elif cmd_type == "clipboard_edit":
+            return ClipboardEditCommand(data.get("operation", "remove_spaces"))
         return None
     
     def __str__(self):
@@ -1295,6 +1294,80 @@ class ClipboardPasteCommand(MacroCommand):
         return "CLIPBOARD: Paste (Ctrl+V)"
 
 
+class CaptureScreenCommand(MacroCommand):
+    def __init__(self, x1, y1, x2, y2):
+        super().__init__("capture_screen")
+        self.x1 = x1
+        self.y1 = y1
+        self.x2 = x2
+        self.y2 = y2
+    
+    def execute(self, context):
+        from PIL import ImageGrab
+        import io
+        import win32clipboard
+        
+        # Capture the specified region
+        screenshot = ImageGrab.grab(bbox=(self.x1, self.y1, self.x2, self.y2))
+        
+        # Convert to BMP format for clipboard
+        output = io.BytesIO()
+        screenshot.convert('RGB').save(output, 'BMP')
+        data = output.getvalue()[14:]  # Remove BMP header
+        output.close()
+        
+        # Copy to clipboard
+        win32clipboard.OpenClipboard()
+        win32clipboard.EmptyClipboard()
+        win32clipboard.SetClipboardData(win32clipboard.CF_DIB, data)
+        win32clipboard.CloseClipboard()
+    
+    def to_dict(self):
+        return {
+            "type": self.command_type,
+            "x1": self.x1,
+            "y1": self.y1,
+            "x2": self.x2,
+            "y2": self.y2
+        }
+    
+    def __str__(self):
+        return f"CAPTURE SCREEN: ({self.x1}, {self.y1}) to ({self.x2}, {self.y2})"
+
+
+class ClipboardEditCommand(MacroCommand):
+    def __init__(self, operation):
+        super().__init__("clipboard_edit")
+        self.operation = operation  # "remove_spaces", "remove_indents", or "proper"
+    
+    def execute(self, context):
+        import pyperclip
+        text = pyperclip.paste()
+        
+        if self.operation == "remove_spaces":
+            text = text.replace(" ", "")
+        elif self.operation == "remove_indents":
+            # Remove leading whitespace from each line
+            lines = text.split('\n')
+            text = '\n'.join(line.lstrip() for line in lines)
+        elif self.operation == "proper":
+            # Capitalize first letter of each word
+            text = text.title()
+        
+        pyperclip.copy(text)
+    
+    def to_dict(self):
+        return {"type": self.command_type, "operation": self.operation}
+    
+    def __str__(self):
+        op_names = {
+            "remove_spaces": "Remove Spaces",
+            "remove_indents": "Remove Indents",
+            "proper": "Proper Case"
+        }
+        return f"CLIPBOARD: Edit ({op_names.get(self.operation, self.operation)})"
+
+
 class SoundCommand(MacroCommand):
     def __init__(self, sound_type="beep"):
         super().__init__("sound")
@@ -1487,7 +1560,10 @@ class MacroMakerApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Macro Maker")
-        self.root.geometry("1000x600")  # Increased width for better button spacing
+        
+        # Set CustomTkinter appearance mode and color theme
+        ctk.set_appearance_mode("dark")  # Modes: "System" (standard), "Dark", "Light"
+        ctk.set_default_color_theme("blue")  # Themes: "blue" (standard), "green", "dark-blue"
         
         self.macros = {}
         self.current_macro = None
@@ -1498,56 +1574,213 @@ class MacroMakerApp:
         self.selected_index = None  # Track selected command
         self.click_timer = None  # Timer for double-click detection
         self.copied_command = None  # Store copied command
+        self.delete_key_pressed = False  # Track delete key state to prevent auto-repeat
         
         # Undo/Redo stacks
         self.undo_stack = []
         self.redo_stack = []
         
+        # Color scheme for different action types
+        self.action_colors = {
+            # Keyboard actions - Blue tones
+            'KeyPressCommand': '#4A90E2',
+            'KeyHoldCommand': '#357ABD',
+            'KeyReleaseCommand': '#6BB6FF',
+            'KeyboardSequenceCommand': '#2E5F8F',
+            
+            # Mouse actions - Green tones
+            'MouseClickCommand': '#50C878',
+            'MouseHoldCommand': '#3DA35D',
+            'MouseReleaseCommand': '#7FD99F',
+            'MouseMoveCommand': '#2F8B57',
+            
+            # Image actions - Purple tones
+            'IfImageCommand': '#9B59B6',
+            'FindImageCommand': '#8E44AD',
+            
+            # Control flow - Orange/Red tones
+            'IfStatementCommand': '#E67E22',
+            'ElseStatementCommand': '#D35400',
+            'EndIfStatementCommand': '#FF8C42',
+            'RepeatCommand': '#E74C3C',
+            'EndRepeatCommand': '#C0392B',
+            
+            # Timing actions - Yellow tones
+            'DelayCommand': '#F39C12',
+            'DelayMsCommand': '#F1C40F',
+            'WaitForWindowCommand': '#D4AC0D',
+            
+            # Utility actions - Cyan tones
+            'MessageCommand': '#1ABC9C',
+            'ClipboardClearCommand': '#16A085',
+            'ClipboardPasteCommand': '#48C9B0',
+            'ClipboardCopyCommand': '#45B39D',
+            'ClipboardEditCommand': '#58D68D',
+            'ClickImageCommand': '#17A589',
+            'RightClickImageCommand': '#138D75',
+            'CommentCommand': '#7F8C8D',
+            
+            # Default
+            'default': '#95A5A6'
+        }
+        
+        # Focus highlighting colors
+        self.focus_color = "#1f6aa5"  # Blue highlight when focused
+        self.default_border_color = "#565b5e"  # Default CustomTkinter border
+        
         self.setup_ui()
+        # Set minimum size and center on screen
+        self.root.minsize(1000, 600)
+        schedule_autosize(self.root, min_size=(1000, 600))
         self.load_macros()
         self.start_hotkey_listener()
     
+    def add_focus_highlighting(self, widget):
+        """Add focus visual indicators to a widget"""
+        original_border = None
+        
+        def on_focus_in(event):
+            nonlocal original_border
+            try:
+                if hasattr(widget, 'cget'):
+                    try:
+                        original_border = widget.cget('border_color')
+                    except:
+                        original_border = self.default_border_color
+                if hasattr(widget, 'configure'):
+                    widget.configure(border_color=self.focus_color)
+            except:
+                pass
+        
+        def on_focus_out(event):
+            try:
+                if hasattr(widget, 'configure'):
+                    widget.configure(border_color=original_border or self.default_border_color)
+            except:
+                pass
+        
+        widget.bind("<FocusIn>", on_focus_in, add="+")
+        widget.bind("<FocusOut>", on_focus_out, add="+")
+    
+    def show_input_dialog(self, title, prompt, initial_value="", input_type="string"):
+        """Show a styled input dialog that replaces simpledialog"""
+        dialog = ctk.CTkToplevel(self.root)
+        dialog.title(title)
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        result = {"value": None}
+        
+        # Create content
+        ctk.CTkLabel(dialog, text=prompt, font=("Arial", 12)).pack(pady=(20, 10), padx=20)
+        
+        entry_var = tk.StringVar(value=str(initial_value) if initial_value else "")
+        entry = ctk.CTkEntry(dialog, textvariable=entry_var, width=300)
+        entry.pack(pady=10, padx=20)
+        self.add_focus_highlighting(entry)
+        entry.focus_set()
+        entry.select_range(0, tk.END)
+        
+        def submit(event=None):
+            val = entry_var.get()
+            try:
+                if input_type == "int":
+                    result["value"] = int(val) if val else None
+                elif input_type == "float":
+                    result["value"] = float(val) if val else None
+                else:
+                    result["value"] = val if val else None
+            except ValueError:
+                result["value"] = None
+            dialog.grab_release()
+            dialog.destroy()
+            return "break"
+        
+        def cancel(event=None):
+            dialog.grab_release()
+            dialog.destroy()
+            return "break"
+        
+        # Button frame
+        btn_frame = ctk.CTkFrame(dialog)
+        btn_frame.pack(pady=15, padx=20)
+        
+        ok_btn = ctk.CTkButton(btn_frame, text="OK", command=submit, width=100)
+        ok_btn.pack(side=tk.LEFT, padx=5)
+        self.add_focus_highlighting(ok_btn)
+        
+        cancel_btn = ctk.CTkButton(btn_frame, text="Cancel", command=cancel, width=100)
+        cancel_btn.pack(side=tk.LEFT, padx=5)
+        self.add_focus_highlighting(cancel_btn)
+        
+        # Bind keys
+        entry.bind("<Return>", submit)
+        dialog.bind("<Escape>", cancel)
+        
+        # Auto-size and center dialog
+        schedule_autosize(dialog)
+        
+        dialog.wait_window()
+        return result["value"]
+    
     def setup_ui(self):
         # Top frame for macro selection
-        top_frame = ttk.Frame(self.root, padding="10")
-        top_frame.pack(fill=tk.X)
+        top_frame = ctk.CTkFrame(self.root)
+        top_frame.pack(fill=tk.X, padx=10, pady=10)
         
-        ttk.Label(top_frame, text="Macro:").pack(side=tk.LEFT, padx=5)
+        ctk.CTkLabel(top_frame, text="Macro:").pack(side=tk.LEFT, padx=5)
         
         self.macro_var = tk.StringVar()
-        self.macro_dropdown = ttk.Combobox(top_frame, textvariable=self.macro_var, width=30)
+        self.macro_dropdown = ctk.CTkComboBox(top_frame, variable=self.macro_var, width=250, command=self._on_macro_dropdown_changed)
         self.macro_dropdown.pack(side=tk.LEFT, padx=5)
-        self.macro_dropdown.bind("<<ComboboxSelected>>", self.on_macro_selected)
+        self.add_focus_highlighting(self.macro_dropdown)
         
-        ttk.Label(top_frame, text="Repeat:").pack(side=tk.LEFT, padx=5)
+        ctk.CTkLabel(top_frame, text="Repeat:").pack(side=tk.LEFT, padx=5)
         self.repeat_var = tk.StringVar(value="1")
-        self.repeat_entry = ttk.Entry(top_frame, textvariable=self.repeat_var, width=10)
+        self.repeat_entry = ctk.CTkEntry(top_frame, textvariable=self.repeat_var, width=80)
         self.repeat_entry.pack(side=tk.LEFT, padx=5)
+        self.add_focus_highlighting(self.repeat_entry)
         
-        ttk.Button(top_frame, text="New Macro", command=self.new_macro).pack(side=tk.LEFT, padx=5)
-        ttk.Button(top_frame, text="Delete Macro", command=self.delete_macro).pack(side=tk.LEFT, padx=5)
-        ttk.Button(top_frame, text="Set Hotkey", command=self.set_hotkey).pack(side=tk.LEFT, padx=5)
-        ttk.Button(top_frame, text="Set Position", command=self.set_window_position).pack(side=tk.LEFT, padx=5)
+        btn_new = ctk.CTkButton(top_frame, text="New Macro", command=self.new_macro, width=100)
+        btn_new.pack(side=tk.LEFT, padx=5)
+        self.add_focus_highlighting(btn_new)
+        
+        btn_delete = ctk.CTkButton(top_frame, text="Delete Macro", command=self.delete_macro, width=100)
+        btn_delete.pack(side=tk.LEFT, padx=5)
+        self.add_focus_highlighting(btn_delete)
+        
+        btn_hotkey = ctk.CTkButton(top_frame, text="Set Hotkey", command=self.set_hotkey, width=100)
+        btn_hotkey.pack(side=tk.LEFT, padx=5)
+        self.add_focus_highlighting(btn_hotkey)
+        
+        btn_remove_hotkey = ctk.CTkButton(top_frame, text="Remove Hotkey", command=self.remove_hotkey, width=120)
+        btn_remove_hotkey.pack(side=tk.LEFT, padx=5)
+        self.add_focus_highlighting(btn_remove_hotkey)
+        
+        btn_position = ctk.CTkButton(top_frame, text="Set Position", command=self.set_window_position, width=100)
+        btn_position.pack(side=tk.LEFT, padx=5)
+        self.add_focus_highlighting(btn_position)
         
         # Middle frame for command list
-        middle_frame = ttk.Frame(self.root, padding="10")
-        middle_frame.pack(fill=tk.BOTH, expand=True)
+        middle_frame = ctk.CTkFrame(self.root)
+        middle_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
         
-        ttk.Label(middle_frame, text="Macro Steps:").pack(anchor=tk.W)
+        ctk.CTkLabel(middle_frame, text="Macro Steps:", font=("Arial", 14, "bold")).pack(anchor=tk.W, padx=10, pady=(10, 5))
         
         # Canvas-based list with scrollbar for image thumbnails
-        list_frame = ttk.Frame(middle_frame)
+        list_frame = ctk.CTkFrame(middle_frame, fg_color="#2b2b2b")
         list_frame.pack(fill=tk.BOTH, expand=True, pady=5)
         
-        scrollbar = ttk.Scrollbar(list_frame)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        # Use CTkScrollbar for consistent styling
+        scrollbar = ctk.CTkScrollbar(list_frame)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 2), pady=2)
         
-        self.command_canvas = tk.Canvas(list_frame, yscrollcommand=scrollbar.set, bg="white", highlightthickness=1, takefocus=1)
-        self.command_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.config(command=self.command_canvas.yview)
+        self.command_canvas = tk.Canvas(list_frame, yscrollcommand=scrollbar.set, bg="#2b2b2b", highlightthickness=1, highlightbackground="#565b5e", takefocus=1)
+        self.command_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=2, pady=2)
+        scrollbar.configure(command=self.command_canvas.yview)
         
         # Frame inside canvas to hold command items
-        self.command_frame = ttk.Frame(self.command_canvas)
+        self.command_frame = tk.Frame(self.command_canvas, bg="#2b2b2b")
         self.canvas_frame_id = self.command_canvas.create_window((0, 0), window=self.command_frame, anchor="nw")
         
         # Enable drag and drop reordering
@@ -1589,60 +1822,113 @@ class MacroMakerApp:
         self.command_canvas.bind("<Control-c>", self.copy_command)
         self.command_canvas.bind("<Control-x>", self.cut_command)
         self.command_canvas.bind("<Control-v>", self.paste_command)
-        self.command_canvas.bind("<Delete>", lambda e: self.remove_command())
+        self.command_canvas.bind("<KeyPress-Delete>", self.on_delete_press)
+        self.command_canvas.bind("<KeyRelease-Delete>", self.on_delete_release)
         
         # Also bind to root window for global shortcuts
         self.root.bind("<Control-c>", self.copy_command)
         self.root.bind("<Control-x>", self.cut_command)
         self.root.bind("<Control-v>", self.paste_command)
-        self.root.bind("<Delete>", lambda e: self.remove_command())
+        self.root.bind("<KeyPress-Delete>", self.on_delete_press)
+        self.root.bind("<KeyRelease-Delete>", self.on_delete_release)
         
         # Command buttons
-        btn_frame = ttk.Frame(middle_frame)
-        btn_frame.pack(fill=tk.X)
+        btn_frame = ctk.CTkFrame(middle_frame)
+        btn_frame.pack(fill=tk.X, padx=10, pady=2)
         
-        ttk.Button(btn_frame, text="Add Keyboard Action", command=self.add_keyboard_sequence).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_frame, text="Add Mouse Click", command=self.add_mouse_click).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_frame, text="Add Mouse Click (Absolute)", command=self.add_mouse_click_absolute).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_frame, text="Add Mouse Move", command=self.add_mouse_move).pack(side=tk.LEFT, padx=2)
+        btn_keyboard = ctk.CTkButton(btn_frame, text="Add Keyboard Action", command=self.add_keyboard_sequence, width=150, fg_color="#4A90E2")
+        btn_keyboard.pack(side=tk.LEFT, padx=2)
+        self.add_focus_highlighting(btn_keyboard)
         
-        btn_frame2 = ttk.Frame(middle_frame)
-        btn_frame2.pack(fill=tk.X, pady=2)
+        btn_mouse = ctk.CTkButton(btn_frame, text="Add Mouse Click", command=self.add_mouse_click, width=130, fg_color="#50C878")
+        btn_mouse.pack(side=tk.LEFT, padx=2)
+        self.add_focus_highlighting(btn_mouse)
         
-        ttk.Button(btn_frame2, text="Add IF", command=self.add_if).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_frame2, text="Add ELSE", command=self.add_else).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_frame2, text="Add ENDIF", command=self.add_endif).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_frame2, text="Add IF IMAGE", command=self.add_if_image).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_frame2, text="Add FIND IMAGE", command=self.add_find_image).pack(side=tk.LEFT, padx=2)
+        btn_mouse_abs = ctk.CTkButton(btn_frame, text="Add Mouse Click (Absolute)", command=self.add_mouse_click_absolute, width=180, fg_color="#50C878")
+        btn_mouse_abs.pack(side=tk.LEFT, padx=2)
+        self.add_focus_highlighting(btn_mouse_abs)
         
-        btn_frame3 = ttk.Frame(middle_frame)
-        btn_frame3.pack(fill=tk.X, pady=2)
+        btn_mouse_move = ctk.CTkButton(btn_frame, text="Add Mouse Move", command=self.add_mouse_move, width=130, fg_color="#2F8B57")
+        btn_mouse_move.pack(side=tk.LEFT, padx=2)
+        self.add_focus_highlighting(btn_mouse_move)
         
-        ttk.Button(btn_frame3, text="Add REPEAT", command=self.add_repeat).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_frame3, text="Add END REPEAT", command=self.add_end_repeat).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_frame3, text="Add Delay", command=self.add_delay).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_frame3, text="Add Delay (ms)", command=self.add_delay_ms).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_frame3, text="Add Message", command=self.add_message).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_frame3, text="Add Sound", command=self.add_sound).pack(side=tk.LEFT, padx=2)
+        btn_frame2 = ctk.CTkFrame(middle_frame)
+        btn_frame2.pack(fill=tk.X, padx=10, pady=2)
         
-        btn_frame4 = ttk.Frame(middle_frame)
-        btn_frame4.pack(fill=tk.X, pady=2)
+        btn_if = ctk.CTkButton(btn_frame2, text="Add IF", command=self.add_if, width=80, fg_color="#E67E22")
+        btn_if.pack(side=tk.LEFT, padx=2)
+        self.add_focus_highlighting(btn_if)
         
-        ttk.Button(btn_frame4, text="Wait For Window", command=self.add_wait_for_window).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_frame4, text="Remove Selected", command=self.remove_command).pack(side=tk.LEFT, padx=2)
+        btn_else = ctk.CTkButton(btn_frame2, text="Add ELSE", command=self.add_else, width=80, fg_color="#D35400")
+        btn_else.pack(side=tk.LEFT, padx=2)
+        self.add_focus_highlighting(btn_else)
+        
+        btn_endif = ctk.CTkButton(btn_frame2, text="Add ENDIF", command=self.add_endif, width=80, fg_color="#FF8C42")
+        btn_endif.pack(side=tk.LEFT, padx=2)
+        self.add_focus_highlighting(btn_endif)
+        btn_if_image = ctk.CTkButton(btn_frame2, text="Add IF IMAGE", command=self.add_if_image, width=110, fg_color="#9B59B6")
+        btn_if_image.pack(side=tk.LEFT, padx=2)
+        self.add_focus_highlighting(btn_if_image)
+        
+        btn_find_image = ctk.CTkButton(btn_frame2, text="Add FIND IMAGE", command=self.add_find_image, width=130, fg_color="#8E44AD")
+        btn_find_image.pack(side=tk.LEFT, padx=2)
+        self.add_focus_highlighting(btn_find_image)
+        
+        btn_frame3 = ctk.CTkFrame(middle_frame)
+        btn_frame3.pack(fill=tk.X, padx=10, pady=2)
+        
+        btn_repeat = ctk.CTkButton(btn_frame3, text="Add REPEAT", command=self.add_repeat, width=110, fg_color="#E74C3C")
+        btn_repeat.pack(side=tk.LEFT, padx=2)
+        self.add_focus_highlighting(btn_repeat)
+        
+        btn_end_repeat = ctk.CTkButton(btn_frame3, text="Add END REPEAT", command=self.add_end_repeat, width=130, fg_color="#C0392B")
+        btn_end_repeat.pack(side=tk.LEFT, padx=2)
+        self.add_focus_highlighting(btn_end_repeat)
+        
+        btn_delay = ctk.CTkButton(btn_frame3, text="Add Delay", command=self.add_delay, width=90, fg_color="#F39C12")
+        btn_delay.pack(side=tk.LEFT, padx=2)
+        self.add_focus_highlighting(btn_delay)
+        
+        btn_delay_ms = ctk.CTkButton(btn_frame3, text="Add Delay (ms)", command=self.add_delay_ms, width=110, fg_color="#F1C40F")
+        btn_delay_ms.pack(side=tk.LEFT, padx=2)
+        self.add_focus_highlighting(btn_delay_ms)
+        
+        btn_message = ctk.CTkButton(btn_frame3, text="Add Message", command=self.add_message, width=110, fg_color="#1ABC9C")
+        btn_message.pack(side=tk.LEFT, padx=2)
+        self.add_focus_highlighting(btn_message)
+        
+        btn_sound = ctk.CTkButton(btn_frame3, text="Add Sound", command=self.add_sound, width=100, fg_color="#16A085")
+        btn_sound.pack(side=tk.LEFT, padx=2)
+        self.add_focus_highlighting(btn_sound)
+        
+        btn_frame4 = ctk.CTkFrame(middle_frame)
+        btn_frame4.pack(fill=tk.X, padx=10, pady=2)
+        
+        btn_wait = ctk.CTkButton(btn_frame4, text="Wait For Window", command=self.add_wait_for_window, width=130, fg_color="#D4AC0D")
+        btn_wait.pack(side=tk.LEFT, padx=2)
+        self.add_focus_highlighting(btn_wait)
+        
+        btn_remove = ctk.CTkButton(btn_frame4, text="Remove Selected", command=self.remove_command, width=130, fg_color="#E74C3C")
+        btn_remove.pack(side=tk.LEFT, padx=2)
+        self.add_focus_highlighting(btn_remove)
         
         # Bottom frame for execution
-        bottom_frame = ttk.Frame(self.root, padding="10")
-        bottom_frame.pack(fill=tk.X)
+        bottom_frame = ctk.CTkFrame(self.root)
+        bottom_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
         
-        ttk.Button(bottom_frame, text="Run Macro", command=self.run_macro).pack(side=tk.LEFT, padx=5)
-        ttk.Button(bottom_frame, text="Stop Macro", command=self.stop_macro).pack(side=tk.LEFT, padx=5)
+        btn_run = ctk.CTkButton(bottom_frame, text="▶ Run Macro", command=self.run_macro, width=140, height=40, fg_color="#27AE60", font=("Arial", 14, "bold"))
+        btn_run.pack(side=tk.LEFT, padx=5, pady=5)
+        self.add_focus_highlighting(btn_run)
         
-        self.status_label = ttk.Label(bottom_frame, text="Ready")
+        btn_stop = ctk.CTkButton(bottom_frame, text="⏹ Stop Macro", command=self.stop_macro, width=140, height=40, fg_color="#C0392B", font=("Arial", 14, "bold"))
+        btn_stop.pack(side=tk.LEFT, padx=5, pady=5)
+        self.add_focus_highlighting(btn_stop)
+        
+        self.status_label = ctk.CTkLabel(bottom_frame, text="Ready", font=("Arial", 12))
         self.status_label.pack(side=tk.LEFT, padx=20)
     
     def update_command_list(self):
-        """Update the command list with thumbnails for image commands"""
+        """Update the command list with thumbnails for image commands and color-coded action types"""
         # Clear existing widgets
         for widget in self.command_frame.winfo_children():
             widget.destroy()
@@ -1673,13 +1959,19 @@ class MacroMakerApp:
         
         # Create a frame for each command
         for idx, cmd in enumerate(self.current_macro.commands):
-            # Determine background color based on selection
-            bg_color = "lightblue" if idx == self.selected_index else "white"
+            # Get the color for this command type
+            cmd_class = cmd.__class__.__name__
+            cmd_color = self.action_colors.get(cmd_class, self.action_colors['default'])
+            
+            # Lighten the color if selected
+            if idx == self.selected_index:
+                # Create a lighter version by mixing with white
+                cmd_color = self._lighten_color(cmd_color, 0.3)
             
             # Calculate indentation based on nesting level
             indent = nesting_levels[idx] * 20  # 20 pixels per nesting level
             
-            cmd_frame = tk.Frame(self.command_frame, relief=tk.RAISED, borderwidth=1, bg=bg_color)
+            cmd_frame = tk.Frame(self.command_frame, relief=tk.RAISED, borderwidth=2, bg=cmd_color, highlightbackground=cmd_color, highlightthickness=2)
             cmd_frame.pack(fill=tk.X, padx=(2 + indent, 2), pady=2)
             cmd_frame._command_index = idx
             
@@ -1689,13 +1981,13 @@ class MacroMakerApp:
                 thumb_label = self._create_thumbnail(cmd_frame, cmd.image_path)
                 if thumb_label:
                     thumb_label.pack(side=tk.LEFT, padx=5, pady=2)
-                    thumb_label.config(bg=bg_color)
+                    thumb_label.config(bg=cmd_color)
                 
-                text_label = tk.Label(cmd_frame, text=str(cmd), anchor=tk.W, bg=bg_color)
+                text_label = tk.Label(cmd_frame, text=str(cmd), anchor=tk.W, bg=cmd_color, fg="white", font=("Arial", 10, "bold"))
                 text_label.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5, pady=5)
             else:
                 # Regular command - just text
-                text_label = tk.Label(cmd_frame, text=str(cmd), anchor=tk.W, bg=bg_color)
+                text_label = tk.Label(cmd_frame, text=str(cmd), anchor=tk.W, bg=cmd_color, fg="white", font=("Arial", 10, "bold"))
                 text_label.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
             
             # Bind events for selection and dragging (double-click must be bound first)
@@ -1881,6 +2173,8 @@ class MacroMakerApp:
             return ClipboardCopyCommand()
         elif cmd_type == 'clipboard_paste':
             return ClipboardPasteCommand()
+        elif cmd_type == 'capture_screen':
+            return CaptureScreenCommand(data['x1'], data['y1'], data['x2'], data['y2'])
         
         return None
     
@@ -1973,7 +2267,7 @@ class MacroMakerApp:
                 self.save_macros()
         
         elif isinstance(cmd, DelayCommand):
-            new_delay = simpledialog.askfloat("Edit Delay", "Enter delay in seconds:", initialvalue=cmd.seconds)
+            new_delay = self.show_input_dialog("Edit Delay", "Enter delay in seconds:", cmd.seconds, "float")
             if new_delay is not None:
                 self.save_state()
                 cmd.seconds = new_delay
@@ -1981,7 +2275,7 @@ class MacroMakerApp:
                 self.save_macros()
         
         elif isinstance(cmd, DelayMsCommand):
-            new_delay = simpledialog.askinteger("Edit Delay (ms)", "Enter delay in milliseconds:", initialvalue=cmd.milliseconds)
+            new_delay = self.show_input_dialog("Edit Delay (ms)", "Enter delay in milliseconds:", cmd.milliseconds, "int")
             if new_delay is not None:
                 self.save_state()
                 cmd.milliseconds = new_delay
@@ -1989,9 +2283,9 @@ class MacroMakerApp:
                 self.save_macros()
         
         elif isinstance(cmd, WaitForWindowCommand):
-            new_pattern = simpledialog.askstring("Edit Wait For Window", "Enter window title pattern (use * as wildcard):", initialvalue=cmd.window_pattern)
+            new_pattern = self.show_input_dialog("Edit Wait For Window", "Enter window title pattern (use * as wildcard):", cmd.window_pattern)
             if new_pattern:
-                new_timeout = simpledialog.askinteger("Edit Timeout", "Enter timeout in seconds:", initialvalue=cmd.timeout)
+                new_timeout = self.show_input_dialog("Edit Timeout", "Enter timeout in seconds:", cmd.timeout, "int")
                 if new_timeout is not None:
                     self.save_state()
                     cmd.window_pattern = new_pattern
@@ -2003,7 +2297,7 @@ class MacroMakerApp:
             self.edit_message_command(cmd)
         
         elif isinstance(cmd, RepeatCommand):
-            new_count = simpledialog.askinteger("Edit Repeat", "Enter repeat count:", initialvalue=cmd.count)
+            new_count = self.show_input_dialog("Edit Repeat", "Enter repeat count:", cmd.count, "int")
             if new_count is not None:
                 self.save_state()
                 cmd.count = new_count
@@ -2234,18 +2528,21 @@ class MacroMakerApp:
             self.update_command_list()
         # If clicked on empty space, don't change selection
         
-        # Create context menu
-        menu = tk.Menu(self.root, tearoff=0)
+        # Create context menu with dark theme styling
+        menu_bg = "#2b2b2b"
+        menu_fg = "#ffffff"
+        menu_active_bg = "#3d3d3d"
+        menu = tk.Menu(self.root, tearoff=0, bg=menu_bg, fg=menu_fg, activebackground=menu_active_bg, activeforeground=menu_fg, relief=tk.FLAT)
         
         # Mouse commands submenu
-        mouse_menu = tk.Menu(menu, tearoff=0)
+        mouse_menu = tk.Menu(menu, tearoff=0, bg=menu_bg, fg=menu_fg, activebackground="#50C878", activeforeground=menu_fg)
         mouse_menu.add_command(label="Click", underline=0, command=lambda: self.insert_command_at_selection("mouse_click"))
         mouse_menu.add_command(label="Click (Absolute)", underline=7, command=lambda: self.insert_command_at_selection("mouse_click_absolute"))
         mouse_menu.add_command(label="Move", underline=0, command=lambda: self.insert_command_at_selection("mouse_move"))
         menu.add_cascade(label="Mouse Commands", underline=0, menu=mouse_menu)
         
         # Keyboard commands submenu
-        keyboard_menu = tk.Menu(menu, tearoff=0)
+        keyboard_menu = tk.Menu(menu, tearoff=0, bg=menu_bg, fg=menu_fg, activebackground="#4A90E2", activeforeground=menu_fg)
         keyboard_menu.add_command(label="Press", underline=0, command=lambda: self.insert_command_at_selection("key_press"))
         keyboard_menu.add_command(label="Hold", underline=0, command=lambda: self.insert_command_at_selection("key_hold"))
         keyboard_menu.add_command(label="Release", underline=0, command=lambda: self.insert_command_at_selection("key_release"))
@@ -2253,33 +2550,35 @@ class MacroMakerApp:
         menu.add_cascade(label="Keyboard Commands", underline=0, menu=keyboard_menu)
         
         # Image commands submenu
-        image_menu = tk.Menu(menu, tearoff=0)
+        image_menu = tk.Menu(menu, tearoff=0, bg=menu_bg, fg=menu_fg, activebackground="#9B59B6", activeforeground=menu_fg)
         image_menu.add_command(label="IF IMAGE", underline=0, command=lambda: self.insert_command_at_selection("if_image"))
         image_menu.add_command(label="FIND IMAGE", underline=0, command=lambda: self.insert_command_at_selection("find_image"))
         menu.add_cascade(label="Image Commands", underline=0, menu=image_menu)
         
         # Control flow commands submenu
-        flow_menu = tk.Menu(menu, tearoff=0)
+        flow_menu = tk.Menu(menu, tearoff=0, bg=menu_bg, fg=menu_fg, activebackground="#E67E22", activeforeground=menu_fg)
         flow_menu.add_command(label="IF Statement", underline=0, command=lambda: self.insert_command_at_selection("if_statement"))
         flow_menu.add_command(label="ELSE", underline=0, command=lambda: self.insert_command_at_selection("else"))
         flow_menu.add_command(label="END IF", underline=4, command=lambda: self.insert_command_at_selection("end_if"))
         flow_menu.add_command(label="REPEAT", underline=0, command=lambda: self.insert_command_at_selection("repeat"))
         flow_menu.add_command(label="END REPEAT", underline=4, command=lambda: self.insert_command_at_selection("end_repeat"))
-        menu.add_cascade(label="Control Flow", underline=0, menu=flow_menu)
+        menu.add_cascade(label="Control Flow", underline=1, menu=flow_menu)
         
         # Clipboard commands submenu
-        clipboard_menu = tk.Menu(menu, tearoff=0)
+        clipboard_menu = tk.Menu(menu, tearoff=0, bg=menu_bg, fg=menu_fg, activebackground="#1ABC9C", activeforeground=menu_fg)
         clipboard_menu.add_command(label="Clear", underline=0, command=lambda: self.insert_command_at_selection("clipboard_clear"))
         clipboard_menu.add_command(label="Set", underline=0, command=lambda: self.insert_command_at_selection("clipboard_set"))
         clipboard_menu.add_command(label="Increment", underline=0, command=lambda: self.insert_command_at_selection("clipboard_increment"))
         clipboard_menu.add_command(label="cOpy", underline=1, command=lambda: self.insert_command_at_selection("clipboard_copy"))
         clipboard_menu.add_command(label="Paste", underline=0, command=lambda: self.insert_command_at_selection("clipboard_paste"))
+        clipboard_menu.add_command(label="Edit", underline=0, command=lambda: self.insert_command_at_selection("clipboard_edit"))
+        clipboard_menu.add_command(label="capture Screen", underline=0, command=lambda: self.insert_command_at_selection("capture_screen"))
         menu.add_cascade(label="Clipboard Commands", underline=0, menu=clipboard_menu)
         
         # Timing/Utility commands submenu
-        timing_menu = tk.Menu(menu, tearoff=0)
+        timing_menu = tk.Menu(menu, tearoff=0, bg=menu_bg, fg=menu_fg, activebackground="#F39C12", activeforeground=menu_fg)
         timing_menu.add_command(label="Delay (seconds)", underline=0, command=lambda: self.insert_command_at_selection("delay"))
-        timing_menu.add_command(label="Delay (Milliseconds)", underline=7, command=lambda: self.insert_command_at_selection("delay_ms"))
+        timing_menu.add_command(label="delay (Milliseconds)", underline=1, command=lambda: self.insert_command_at_selection("delay_ms"))
         timing_menu.add_command(label="Wait for Window", underline=0, command=lambda: self.insert_command_at_selection("wait_for_window"))
         timing_menu.add_command(label="Message", underline=0, command=lambda: self.insert_command_at_selection("message"))
         timing_menu.add_command(label="Sound", underline=0, command=lambda: self.insert_command_at_selection("sound"))
@@ -2338,6 +2637,10 @@ class MacroMakerApp:
             self.add_clipboard_copy(insert_index)
         elif command_type == "clipboard_paste":
             self.add_clipboard_paste(insert_index)
+        elif command_type == "clipboard_edit":
+            self.add_clipboard_edit(insert_index)
+        elif command_type == "capture_screen":
+            self.add_capture_screen(insert_index)
         elif command_type == "wait_for_window":
             self.add_wait_for_window_at_index(insert_index)
         elif command_type == "message":
@@ -2477,6 +2780,10 @@ class MacroMakerApp:
         self.drag_data["widget"] = None
         self.drag_data["started"] = False
     
+    def _on_macro_dropdown_changed(self, choice):
+        """Wrapper for CustomTkinter combobox callback"""
+        self.on_macro_selected()
+    
     def on_macro_selected(self, event=None):
         """Handle macro selection from dropdown"""
         macro_name = self.macro_var.get()
@@ -2484,9 +2791,9 @@ class MacroMakerApp:
             self.current_macro = self.macros[macro_name]
             self.update_command_list()
             if self.current_macro.hotkey:
-                self.status_label.config(text=f"Hotkey: {self.current_macro.hotkey}")
+                self.status_label.configure(text=f"Hotkey: {self.current_macro.hotkey}")
             else:
-                self.status_label.config(text="Ready")
+                self.status_label.configure(text="Ready")
             
             # Restore window position if saved
             if self.current_macro.window_geometry:
@@ -2497,7 +2804,7 @@ class MacroMakerApp:
     
     def new_macro(self):
         """Create a new macro"""
-        name = simpledialog.askstring("New Macro", "Enter macro name:")
+        name = self.show_input_dialog("New Macro", "Enter macro name:")
         if name and name not in self.macros:
             self.macros[name] = Macro(name)
             self.update_macro_list()
@@ -2527,7 +2834,7 @@ class MacroMakerApp:
     
     def update_macro_list(self):
         """Update the dropdown with available macros"""
-        self.macro_dropdown['values'] = list(self.macros.keys())
+        self.macro_dropdown.configure(values=list(self.macros.keys()))
     
     def ensure_dialog_focused(self, dialog):
         """Ensure dialog is focused and remains focused"""
@@ -2546,14 +2853,14 @@ class MacroMakerApp:
             return
         
         # Create dialog to capture hotkey
-        dialog = tk.Toplevel(self.root)
+        dialog = ctk.CTkToplevel(self.root)
         dialog.title("Set Hotkey")
         dialog.transient(self.root)
         dialog.grab_set()
         
-        ttk.Label(dialog, text="Press the key combination you want to use:").pack(pady=20)
+        ctk.CTkLabel(dialog, text="Press the key combination you want to use:").pack(pady=20)
         
-        hotkey_label = ttk.Label(dialog, text="Waiting...", font=("Arial", 12, "bold"))
+        hotkey_label = ctk.CTkLabel(dialog, text="Waiting...", font=("Arial", 14, "bold"))
         hotkey_label.pack(pady=10)
         
         captured_keys = []
@@ -2562,7 +2869,7 @@ class MacroMakerApp:
             key = event.name
             if key not in captured_keys:
                 captured_keys.append(key)
-                hotkey_label.config(text=" + ".join(captured_keys))
+                hotkey_label.configure(text=" + ".join(captured_keys))
         
         keyboard.hook(on_key)
         
@@ -2583,31 +2890,51 @@ class MacroMakerApp:
                 self.current_macro.hotkey = hotkey
                 self.register_hotkey(self.current_macro)
                 self.save_macros()
-                self.status_label.config(text=f"Hotkey set: {hotkey}")
+                self.status_label.configure(text=f"Hotkey set: {hotkey}")
             dialog.destroy()
         
         def on_cancel():
             keyboard.unhook_all()
             dialog.destroy()
         
-        ok_btn = ttk.Button(dialog, text="OK", command=on_ok)
-        ok_btn.pack(side=tk.LEFT, padx=50, pady=10)
-        ttk.Button(dialog, text="Cancel", command=on_cancel).pack(side=tk.RIGHT, padx=50, pady=10)
+        btn_frame = ctk.CTkFrame(dialog)
+        btn_frame.pack(pady=10)
+        ok_btn = ctk.CTkButton(btn_frame, text="OK", command=on_ok, width=80)
+        ok_btn.pack(side=tk.LEFT, padx=20)
+        ctk.CTkButton(btn_frame, text="Cancel", command=on_cancel, width=80).pack(side=tk.RIGHT, padx=20)
         
         # Bind Escape to cancel
         dialog.bind('<Escape>', lambda e: on_cancel())
         
-        # Center the dialog after packing all widgets
-        dialog.update_idletasks()
-        width = dialog.winfo_width()
-        height = dialog.winfo_height()
-        screen_width = dialog.winfo_screenwidth()
-        screen_height = dialog.winfo_screenheight()
-        x = (screen_width - width) // 2
-        y = (screen_height - height) // 2
-        dialog.geometry(f"{width}x{height}+{x}+{y}")
+        # Auto-size and center dialog
+        schedule_autosize(dialog)
         
         self.ensure_dialog_focused(dialog)
+    
+    def remove_hotkey(self):
+        """Remove the hotkey from the current macro"""
+        if not self.current_macro:
+            messagebox.showwarning("Warning", "Please select a macro first")
+            return
+        
+        if not self.current_macro.hotkey:
+            messagebox.showinfo("Info", "This macro has no hotkey assigned")
+            return
+        
+        # Confirm removal
+        if messagebox.askyesno("Confirm", f"Remove hotkey '{self.current_macro.hotkey}' from this macro?"):
+            # Unregister the hotkey
+            if self.current_macro.hotkey in self.hotkey_handlers:
+                try:
+                    keyboard.remove_hotkey(self.hotkey_handlers[self.current_macro.hotkey])
+                    del self.hotkey_handlers[self.current_macro.hotkey]
+                except Exception as e:
+                    print(f"Error removing hotkey: {e}")
+            
+            # Clear the hotkey from the macro
+            self.current_macro.hotkey = None
+            self.save_macros()
+            messagebox.showinfo("Success", "Hotkey removed successfully")
     
     def register_hotkey(self, macro):
         """Register a hotkey for a macro"""
@@ -2619,11 +2946,17 @@ class MacroMakerApp:
                 print(f"Error registering hotkey: {e}")
     
     def trigger_macro(self, macro):
-        """Triggered when hotkey is pressed"""
-        self.macro_var.set(macro.name)
-        self.current_macro = macro
-        self.update_command_list()
-        if not self.executor.running:
+        """Triggered when hotkey is pressed - toggles start/stop"""
+        if self.executor.running:
+            # Stop the running macro
+            self.stop_macro()
+        else:
+            # Start the macro
+            def on_main_thread():
+                self.macro_var.set(macro.name)
+                self.current_macro = macro
+                self.update_command_list()
+            self.root.after(0, on_main_thread)
             threading.Thread(target=self.run_macro, daemon=True).start()
     
     def show_key_selector(self, title):
@@ -2658,18 +2991,18 @@ class MacroMakerApp:
             '{', '}', '|', ':', '"', '<', '>', '?',
         ]
         
-        dialog = tk.Toplevel(self.root)
+        dialog = ctk.CTkToplevel(self.root)
         dialog.title(title)
         dialog.transient(self.root)
         dialog.grab_set()
         
         result = {'key': None}
         
-        tk.Label(dialog, text="Select or type to search for a key:", font=("Arial", 10)).pack(pady=10, padx=20)
+        ctk.CTkLabel(dialog, text="Select or type to search for a key:").pack(pady=10, padx=20)
         
         # Create combobox with all keys
         key_var = tk.StringVar()
-        combo = ttk.Combobox(dialog, textvariable=key_var, values=all_keys, width=30, state='readonly')
+        combo = ctk.CTkComboBox(dialog, variable=key_var, values=all_keys, width=200)
         combo.pack(pady=10, padx=20)
         
         # Type-ahead search state
@@ -2702,7 +3035,7 @@ class MacroMakerApp:
             found = False
             for i in range(start_index, len(all_keys)):
                 if all_keys[i].lower().startswith(char):
-                    combo.current(i)
+                    combo.set(all_keys[i])
                     search_state['current_index'] = i
                     found = True
                     break
@@ -2711,7 +3044,7 @@ class MacroMakerApp:
             if not found and start_index > 0:
                 for i in range(0, start_index):
                     if all_keys[i].lower().startswith(char):
-                        combo.current(i)
+                        combo.set(all_keys[i])
                         search_state['current_index'] = i
                         found = True
                         break
@@ -2736,42 +3069,20 @@ class MacroMakerApp:
         combo.bind('<Return>', lambda e: on_ok())
         combo.bind('<Escape>', lambda e: on_cancel())
         
-        btn_frame = tk.Frame(dialog)
+        btn_frame = ctk.CTkFrame(dialog)
         btn_frame.pack(pady=10)
-        ok_btn = ttk.Button(btn_frame, text="OK", command=on_ok)
+        ok_btn = ctk.CTkButton(btn_frame, text="OK", command=on_ok, width=80)
         ok_btn.pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_frame, text="Cancel", command=on_cancel).pack(side=tk.LEFT, padx=5)
+        ctk.CTkButton(btn_frame, text="Cancel", command=on_cancel, width=80).pack(side=tk.LEFT, padx=5)
         
-        # Center the dialog
-        dialog.update_idletasks()
-        width = dialog.winfo_width()
-        height = dialog.winfo_height()
-        screen_width = dialog.winfo_screenwidth()
-        screen_height = dialog.winfo_screenheight()
-        x = (screen_width - width) // 2
-        y = (screen_height - height) // 2
-        dialog.geometry(f"{width}x{height}+{x}+{y}")
+        # Auto-size and center dialog
+        schedule_autosize(dialog)
         
         self.ensure_dialog_focused(dialog)
-        
-        # Re-center and focus
-        def recenter():
-            dialog.update_idletasks()
-            w = dialog.winfo_width()
-            h = dialog.winfo_height()
-            sw = dialog.winfo_screenwidth()
-            sh = dialog.winfo_screenheight()
-            new_x = (sw - w) // 2
-            new_y = (sh - h) // 2
-            dialog.geometry(f"{w}x{h}+{new_x}+{new_y}")
-            dialog.focus_force()
-            dialog.lift()
         
         def focus_combo():
             combo.focus_set()
         
-        dialog.after(10, recenter)
-        dialog.after(30, recenter)
         dialog.after(80, focus_combo)
         
         dialog.wait_window()
@@ -2788,14 +3099,14 @@ class MacroMakerApp:
             ("custom", "Custom sound file...")
         ]
         
-        dialog = tk.Toplevel(self.root)
+        dialog = ctk.CTkToplevel(self.root)
         dialog.title("Select Sound")
         dialog.transient(self.root)
         dialog.grab_set()
         
         result = {'command': None}
         
-        tk.Label(dialog, text="Choose a sound to play:", font=("Arial", 10)).pack(pady=10, padx=20)
+        ctk.CTkLabel(dialog, text="Choose a sound to play:").pack(pady=10, padx=20)
         
         # Sound type selection
         sound_var = tk.StringVar(value="beep")
@@ -2834,11 +3145,11 @@ class MacroMakerApp:
         
         for sound_type, description in sound_types:
             # Create a frame for each sound option
-            option_frame = ttk.Frame(dialog)
+            option_frame = ctk.CTkFrame(dialog)
             option_frame.pack(fill=tk.X, padx=20, pady=2)
             
             # Radio button
-            ttk.Radiobutton(
+            ctk.CTkRadioButton(
                 option_frame, 
                 text=f"{sound_type.title()}: {description}", 
                 variable=sound_var, 
@@ -2846,19 +3157,19 @@ class MacroMakerApp:
             ).pack(side=tk.LEFT, fill=tk.X, expand=True)
             
             # Play button
-            play_btn = ttk.Button(
+            play_btn = ctk.CTkButton(
                 option_frame, 
                 text="▶", 
-                width=3, 
+                width=30, 
                 command=lambda st=sound_type: play_sound(st)
             )
             play_btn.pack(side=tk.RIGHT)
         
         # Custom sound file entry (initially hidden)
-        custom_frame = ttk.Frame(dialog)
-        custom_label = ttk.Label(custom_frame, text="Sound file path:")
-        custom_entry = ttk.Entry(custom_frame, width=40)
-        custom_browse = ttk.Button(custom_frame, text="Browse...", command=lambda: self.browse_sound_file(custom_entry))
+        custom_frame = ctk.CTkFrame(dialog)
+        custom_label = ctk.CTkLabel(custom_frame, text="Sound file path:")
+        custom_entry = ctk.CTkEntry(custom_frame, width=250)
+        custom_browse = ctk.CTkButton(custom_frame, text="Browse...", command=lambda: self.browse_sound_file(custom_entry), width=80)
         
         def on_sound_change(*args):
             if sound_var.get() == "custom":
@@ -2890,21 +3201,14 @@ class MacroMakerApp:
         def on_cancel():
             dialog.destroy()
         
-        btn_frame = tk.Frame(dialog)
+        btn_frame = ctk.CTkFrame(dialog)
         btn_frame.pack(pady=10)
-        ok_btn = ttk.Button(btn_frame, text="OK", command=on_ok)
+        ok_btn = ctk.CTkButton(btn_frame, text="OK", command=on_ok, width=80)
         ok_btn.pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_frame, text="Cancel", command=on_cancel).pack(side=tk.LEFT, padx=5)
+        ctk.CTkButton(btn_frame, text="Cancel", command=on_cancel, width=80).pack(side=tk.LEFT, padx=5)
         
-        # Center the dialog
-        dialog.update_idletasks()
-        width = dialog.winfo_width()
-        height = dialog.winfo_height()
-        screen_width = dialog.winfo_screenwidth()
-        screen_height = dialog.winfo_screenheight()
-        x = (screen_width - width) // 2
-        y = (screen_height - height) // 2
-        dialog.geometry(f"{width}x{height}+{x}+{y}")
+        # Auto-size and center dialog
+        schedule_autosize(dialog)
         
         self.ensure_dialog_focused(dialog)
         
@@ -2962,17 +3266,17 @@ class MacroMakerApp:
         
         actions = ['press', 'hold', 'release']
         
-        dialog = tk.Toplevel(self.root)
+        dialog = ctk.CTkToplevel(self.root)
         dialog.title("Keyboard Sequence")
         dialog.transient(self.root)
         dialog.grab_set()
         
         result = {'sequence': []}
         
-        tk.Label(dialog, text="Build your keyboard sequence:", font=("Arial", 10)).pack(pady=10, padx=20)
+        ctk.CTkLabel(dialog, text="Build your keyboard sequence:").pack(pady=10, padx=20)
         
         # Frame for the sequence items
-        sequence_frame = ttk.Frame(dialog)
+        sequence_frame = ctk.CTkFrame(dialog)
         sequence_frame.pack(pady=5, padx=20, fill=tk.BOTH, expand=True)
         
         # List to hold the row frames
@@ -2981,12 +3285,12 @@ class MacroMakerApp:
         
         def add_sequence_row(key='', action='press'):
             """Add a new row for key-action pair"""
-            row_frame = ttk.Frame(sequence_frame)
+            row_frame = ctk.CTkFrame(sequence_frame)
             row_frame.pack(fill=tk.X, pady=2)
             
             # Key dropdown
             key_var = tk.StringVar(value=key)
-            key_combo = ttk.Combobox(row_frame, textvariable=key_var, values=all_keys, width=15, state='readonly')
+            key_combo = ctk.CTkComboBox(row_frame, variable=key_var, values=all_keys, width=120)
             key_combo.pack(side=tk.LEFT, padx=2)
             
             # Type-ahead search state for this combo
@@ -3019,7 +3323,7 @@ class MacroMakerApp:
                 found = False
                 for i in range(start_index, len(all_keys)):
                     if all_keys[i].lower().startswith(char):
-                        key_combo.current(i)
+                        key_combo.set(all_keys[i])
                         search_state['current_index'] = i
                         found = True
                         break
@@ -3028,7 +3332,7 @@ class MacroMakerApp:
                 if not found and start_index > 0:
                     for i in range(0, start_index):
                         if all_keys[i].lower().startswith(char):
-                            key_combo.current(i)
+                            key_combo.set(all_keys[i])
                             search_state['current_index'] = i
                             found = True
                             break
@@ -3048,12 +3352,12 @@ class MacroMakerApp:
                 action_var.set(new_action)
                 update_action_buttons()
             
-            action_frame = ttk.Frame(row_frame)
+            action_frame = ctk.CTkFrame(row_frame)
             action_frame.pack(side=tk.LEFT, padx=5)
             
-            left_btn = ttk.Button(action_frame, text="◀", width=3, command=lambda: select_action(actions[(actions.index(action_var.get()) - 1) % len(actions)]))
-            action_label = ttk.Label(action_frame, textvariable=action_var, width=8, anchor='center')
-            right_btn = ttk.Button(action_frame, text="▶", width=3, command=lambda: select_action(actions[(actions.index(action_var.get()) + 1) % len(actions)]))
+            left_btn = ctk.CTkButton(action_frame, text="◀", width=30, command=lambda: select_action(actions[(actions.index(action_var.get()) - 1) % len(actions)]))
+            action_label = ctk.CTkLabel(action_frame, textvariable=action_var, width=80)
+            right_btn = ctk.CTkButton(action_frame, text="▶", width=30, command=lambda: select_action(actions[(actions.index(action_var.get()) + 1) % len(actions)]))
             
             left_btn.pack(side=tk.LEFT)
             action_label.pack(side=tk.LEFT)
@@ -3098,7 +3402,7 @@ class MacroMakerApp:
                 _, _, _, last_combo = row_frames[-1]
                 last_combo.focus_set()
         
-        ttk.Button(dialog, text="Add Key", command=add_and_focus).pack(pady=5)
+        ctk.CTkButton(dialog, text="Add Key", command=add_and_focus, width=100).pack(pady=5)
         
         # Keyboard navigation
         def change_action(direction):
@@ -3138,21 +3442,14 @@ class MacroMakerApp:
         def on_cancel():
             dialog.destroy()
         
-        btn_frame = tk.Frame(dialog)
+        btn_frame = ctk.CTkFrame(dialog)
         btn_frame.pack(pady=10)
-        ok_btn = ttk.Button(btn_frame, text="OK", command=on_ok)
+        ok_btn = ctk.CTkButton(btn_frame, text="OK", command=on_ok, width=80)
         ok_btn.pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_frame, text="Cancel", command=on_cancel).pack(side=tk.LEFT, padx=5)
+        ctk.CTkButton(btn_frame, text="Cancel", command=on_cancel, width=80).pack(side=tk.LEFT, padx=5)
         
-        # Center the dialog
-        dialog.update_idletasks()
-        width = dialog.winfo_width()
-        height = dialog.winfo_height()
-        screen_width = dialog.winfo_screenwidth()
-        screen_height = dialog.winfo_screenheight()
-        x = (screen_width - width) // 2
-        y = (screen_height - height) // 2
-        dialog.geometry(f"{width}x{height}+{x}+{y}")
+        # Auto-size and center dialog
+        schedule_autosize(dialog)
         
         self.ensure_dialog_focused(dialog)
         
@@ -3289,11 +3586,11 @@ class MacroMakerApp:
     
     def show_click_mode_dialog(self):
         """Show dialog to choose click mode: in place or offset"""
-        dialog = tk.Toplevel(self.root)
+        dialog = ctk.CTkToplevel(self.root)
         dialog.title("Click Mode")
         dialog.transient(self.root)
         
-        tk.Label(dialog, text="Click in place/offset?", font=("Arial", 10)).pack(pady=20)
+        ctk.CTkLabel(dialog, text="Click in place/offset?").pack(pady=20)
         
         result = {"mode": None}
         
@@ -3307,13 +3604,13 @@ class MacroMakerApp:
             dialog.destroy()
             return "break"
         
-        btn_frame = tk.Frame(dialog)
+        btn_frame = ctk.CTkFrame(dialog)
         btn_frame.pack(pady=10)
         
-        in_place_btn = tk.Button(btn_frame, text="In Place", command=choose_in_place, width=12)
+        in_place_btn = ctk.CTkButton(btn_frame, text="In Place", command=choose_in_place, width=100)
         in_place_btn.pack(side=tk.LEFT, padx=5)
         
-        offset_btn = tk.Button(btn_frame, text="Offset", command=choose_offset, width=12)
+        offset_btn = ctk.CTkButton(btn_frame, text="Offset", command=choose_offset, width=100)
         offset_btn.pack(side=tk.LEFT, padx=5)
         
         # Bind keyboard shortcuts
@@ -3323,46 +3620,19 @@ class MacroMakerApp:
         dialog.bind("2", choose_offset)
         dialog.bind('<Escape>', lambda e: dialog.destroy())
         
-        # Now that all widgets are packed, center the dialog
-        dialog.update_idletasks()
-        
-        # Get actual dialog size after widgets are laid out
-        width = dialog.winfo_reqwidth()
-        height = dialog.winfo_reqheight()
-        
-        # Get screen dimensions
-        screen_width = dialog.winfo_screenwidth()
-        screen_height = dialog.winfo_screenheight()
-        
-        # Calculate center position
-        x = (screen_width - width) // 2
-        y = (screen_height - height) // 2
-        
-        # Set geometry with calculated position
-        dialog.geometry(f"+{x}+{y}")
-        
         # Grab focus and bring to front
         dialog.grab_set()
+        
+        # Auto-size and center dialog
+        schedule_autosize(dialog)
+        
         self.ensure_dialog_focused(dialog)
         
-        # Force reposition after window appears (Windows workaround)
-        def reposition_and_focus():
-            dialog.update_idletasks()
-            # Recalculate in case window size changed
-            w = dialog.winfo_width()
-            h = dialog.winfo_height()
-            sw = dialog.winfo_screenwidth()
-            sh = dialog.winfo_screenheight()
-            new_x = (sw - w) // 2
-            new_y = (sh - h) // 2
-            dialog.geometry(f"+{new_x}+{new_y}")
-            dialog.focus_force()
-            dialog.lift()
-            # Refocus first button after recentering
+        # Focus first button after window appears
+        def focus_first_button():
             in_place_btn.focus_set()
         
-        dialog.after(10, reposition_and_focus)
-        dialog.after(30, reposition_and_focus)
+        dialog.after(50, focus_first_button)
         
         dialog.wait_window()
         return result["mode"]
@@ -3404,7 +3674,7 @@ class MacroMakerApp:
             messagebox.showwarning("Warning", "Please select a macro first")
             return
         
-        button = simpledialog.askstring("Mouse Click", "Enter button (left/right/middle):", initialvalue="left")
+        button = self.show_input_dialog("Mouse Click", "Enter button (left/right/middle):", "left")
         if button:
             # Show in-place/offset dialog
             mode_result = self.show_click_mode_dialog()
@@ -3414,9 +3684,9 @@ class MacroMakerApp:
                 if mode_result == "in_place":
                     cmd = MouseClickCommand(button, 0, 0, mode="in_place")
                 elif mode_result == "offset":
-                    offset_x = simpledialog.askinteger("X Offset", "Enter X offset (pixels, can be negative):", initialvalue=0)
+                    offset_x = self.show_input_dialog("X Offset", "Enter X offset (pixels, can be negative):", 0, "int")
                     if offset_x is not None:
-                        offset_y = simpledialog.askinteger("Y Offset", "Enter Y offset (pixels, can be negative):", initialvalue=0)
+                        offset_y = self.show_input_dialog("Y Offset", "Enter Y offset (pixels, can be negative):", 0, "int")
                         if offset_y is not None:
                             cmd = MouseClickCommand(button, 0, 0, mode="offset", offset_x=offset_x, offset_y=offset_y)
                         else:
@@ -3440,7 +3710,7 @@ class MacroMakerApp:
             messagebox.showwarning("Warning", "Please select a macro first")
             return
         
-        button = simpledialog.askstring("Mouse Click (Absolute)", "Enter button (left/right/middle):", initialvalue="left")
+        button = self.show_input_dialog("Mouse Click (Absolute)", "Enter button (left/right/middle):", "left")
         if button:
             # Show instructions
             messagebox.showinfo(
@@ -3499,6 +3769,8 @@ class MacroMakerApp:
                 self.selected_index = len(self.current_macro.commands) - 1
             self.update_command_list()
             self.save_macros()
+        else:
+            messagebox.showwarning("Cancelled", "Mouse position capture was cancelled.")
     
     def add_if(self, insert_index=None):
         """Add IF statement"""
@@ -3506,7 +3778,7 @@ class MacroMakerApp:
             messagebox.showwarning("Warning", "Please select a macro first")
             return
         
-        condition = simpledialog.askstring("IF Statement", "Enter condition (e.g., clipboard == 'value'):")
+        condition = self.show_input_dialog("IF Statement", "Enter condition (e.g., clipboard == 'value'):")
         if condition:
             self.save_state()
             cmd = IfStatementCommand(condition)
@@ -3533,14 +3805,10 @@ class MacroMakerApp:
         cmd = ElseStatementCommand()
         if insert_index is not None:
             self.current_macro.commands.insert(insert_index, cmd)
-            # Auto-insert ENDIF right after ELSE
-            self.current_macro.commands.insert(insert_index + 1, EndIfStatementCommand())
             self.selected_index = insert_index
         else:
             self.current_macro.add_command(cmd)
-            # Auto-insert ENDIF right after ELSE
-            self.current_macro.commands.insert(len(self.current_macro.commands), EndIfStatementCommand())
-            self.selected_index = len(self.current_macro.commands) - 2
+            self.selected_index = len(self.current_macro.commands) - 1
         self.update_command_list()
         self.save_macros()
     
@@ -3567,7 +3835,7 @@ class MacroMakerApp:
             messagebox.showwarning("Warning", "Please select a macro first")
             return
         
-        image_name = simpledialog.askstring("Image Name", "Enter name for this image:")
+        image_name = self.show_input_dialog("Image Name", "Enter name for this image:")
         if not image_name:
             return
         
@@ -3583,36 +3851,38 @@ class MacroMakerApp:
             self.show_image_preview(screenshot, "Captured Image")
             
             # Create dialog for options
-            dialog = tk.Toplevel(self.root)
+            dialog = ctk.CTkToplevel(self.root)
             dialog.title("IF IMAGE Options")
             dialog.transient(self.root)
             dialog.grab_set()
             
-            # Confidence slider
-            conf_frame = ttk.Frame(dialog)
-            conf_frame.pack(pady=10)
-            ttk.Label(conf_frame, text="Confidence:").pack(side=tk.LEFT, padx=5)
-            conf_var = tk.DoubleVar(value=0.8)
-            conf_scale = ttk.Scale(conf_frame, from_=0.1, to=1.0, variable=conf_var, orient=tk.HORIZONTAL, length=150)
-            conf_scale.pack(side=tk.LEFT, padx=5)
-            conf_label = ttk.Label(conf_frame, text="0.80")
-            conf_label.pack(side=tk.LEFT, padx=5)
-            
-            def update_conf_label(event=None):
-                conf_label.config(text=f"{conf_var.get():.2f}")
-            conf_scale.bind("<Motion>", update_conf_label)
-            conf_scale.bind("<ButtonRelease-1>", update_conf_label)
+            # Confidence entry
+            conf_frame = ctk.CTkFrame(dialog)
+            conf_frame.pack(pady=10, padx=10, fill=tk.X)
+            ctk.CTkLabel(conf_frame, text="Confidence (0.1-1.0):").pack(side=tk.LEFT, padx=5)
+            conf_var = tk.StringVar(value="0.80")
+            conf_entry = ctk.CTkEntry(conf_frame, textvariable=conf_var, width=80)
+            conf_entry.pack(side=tk.LEFT, padx=5)
             
             # Move to image checkbox
             move_var = tk.BooleanVar(value=False)
-            tk.Checkbutton(dialog, text="Move mouse to image if found", variable=move_var).pack(pady=10)
+            move_check = ctk.CTkCheckBox(dialog, text="Move mouse to image if found", variable=move_var)
+            move_check.pack(pady=10)
             
             # Search within area checkbox
             search_area_var = tk.BooleanVar(value=False)
-            tk.Checkbutton(dialog, text="Search within area", variable=search_area_var).pack(pady=10)
+            search_check = ctk.CTkCheckBox(dialog, text="Search within area", variable=search_area_var)
+            search_check.pack(pady=10)
             
             # Buttons
             def save_options():
+                # Parse confidence value
+                try:
+                    conf_value = float(conf_var.get())
+                    conf_value = max(0.1, min(1.0, conf_value))  # Clamp between 0.1 and 1.0
+                except ValueError:
+                    conf_value = 0.8
+                
                 search_region = None
                 if search_area_var.get():
                     # Capture search area
@@ -3625,7 +3895,7 @@ class MacroMakerApp:
                         search_region = None
                 
                 self.save_state()
-                self.current_macro.add_command(IfImageCommand(image_path, conf_var.get(), move_var.get(), None, search_region))
+                self.current_macro.add_command(IfImageCommand(image_path, conf_value, move_var.get(), None, search_region))
                 # Auto-insert ENDIF right after IF IMAGE
                 self.current_macro.commands.insert(len(self.current_macro.commands), EndIfStatementCommand())
                 # Select IF IMAGE (not ENDIF)
@@ -3634,48 +3904,26 @@ class MacroMakerApp:
                 self.save_macros()
                 dialog.destroy()
             
-            btn_frame = tk.Frame(dialog)
+            btn_frame = ctk.CTkFrame(dialog)
             btn_frame.pack(pady=20)
-            ok_btn = tk.Button(btn_frame, text="OK", command=save_options, width=10)
+            ok_btn = ctk.CTkButton(btn_frame, text="OK", command=save_options, width=100)
             ok_btn.pack(side=tk.LEFT, padx=5)
-            tk.Button(btn_frame, text="Cancel", command=dialog.destroy, width=10).pack(side=tk.LEFT, padx=5)
+            ctk.CTkButton(btn_frame, text="Cancel", command=dialog.destroy, width=100).pack(side=tk.LEFT, padx=5)
             
             # Bind Escape to cancel
             dialog.bind('<Escape>', lambda e: dialog.destroy())
             
-            # Center the dialog
-            dialog.update_idletasks()
-            width = dialog.winfo_width()
-            height = dialog.winfo_height()
-            screen_width = dialog.winfo_screenwidth()
-            screen_height = dialog.winfo_screenheight()
-            x = (screen_width - width) // 2
-            y = (screen_height - height) // 2
-            dialog.geometry(f"{width}x{height}+{x}+{y}")
+            # Auto-size and center dialog
+            schedule_autosize(dialog)
             
             self.ensure_dialog_focused(dialog)
             
-            # Re-center after a short delay
-            def recenter():
-                dialog.update_idletasks()
-                w = dialog.winfo_width()
-                h = dialog.winfo_height()
-                sw = dialog.winfo_screenwidth()
-                sh = dialog.winfo_screenheight()
-                new_x = (sw - w) // 2
-                new_y = (sh - h) // 2
-                dialog.geometry(f"{w}x{h}+{new_x}+{new_y}")
-                dialog.focus_force()
-                dialog.lift()
-                # Refocus OK button after recentering
-                ok_btn.focus_set()
-            
-            dialog.after(10, recenter)
-            dialog.after(30, recenter)
+            # Focus OK button after window appears
+            dialog.after(50, lambda: ok_btn.focus_set())
     
     def add_if_image_at_index(self, insert_index):
         """Add IF IMAGE command at specific index"""
-        image_name = simpledialog.askstring("Image Name", "Enter name for this image:")
+        image_name = self.show_input_dialog("Image Name", "Enter name for this image:")
         if not image_name:
             return
         
@@ -3688,78 +3936,55 @@ class MacroMakerApp:
             
             self.show_image_preview(screenshot, "Captured Image")
             
-            dialog = tk.Toplevel(self.root)
+            dialog = ctk.CTkToplevel(self.root)
             dialog.title("IF IMAGE Options")
             dialog.transient(self.root)
             dialog.grab_set()
             
-            conf_frame = ttk.Frame(dialog)
-            conf_frame.pack(pady=10)
-            ttk.Label(conf_frame, text="Confidence:").pack(side=tk.LEFT, padx=5)
-            conf_var = tk.DoubleVar(value=0.8)
-            conf_scale = ttk.Scale(conf_frame, from_=0.1, to=1.0, variable=conf_var, orient=tk.HORIZONTAL, length=150)
-            conf_scale.pack(side=tk.LEFT, padx=5)
-            conf_label = ttk.Label(conf_frame, text="0.80")
-            conf_label.pack(side=tk.LEFT, padx=5)
-            
-            def update_conf_label(event=None):
-                conf_label.config(text=f"{conf_var.get():.2f}")
-            conf_scale.bind("<Motion>", update_conf_label)
-            conf_scale.bind("<ButtonRelease-1>", update_conf_label)
+            conf_frame = ctk.CTkFrame(dialog)
+            conf_frame.pack(pady=10, padx=10, fill=tk.X)
+            ctk.CTkLabel(conf_frame, text="Confidence (0.1-1.0):").pack(side=tk.LEFT, padx=5)
+            conf_var = tk.StringVar(value="0.80")
+            conf_entry = ctk.CTkEntry(conf_frame, textvariable=conf_var, width=80)
+            conf_entry.pack(side=tk.LEFT, padx=5)
             
             move_var = tk.BooleanVar(value=False)
-            tk.Checkbutton(dialog, text="Move mouse to image if found", variable=move_var).pack(pady=10)
+            move_check = ctk.CTkCheckBox(dialog, text="Move mouse to image if found", variable=move_var)
+            move_check.pack(pady=10)
             
             def save_options():
-                self.current_macro.commands.insert(insert_index, IfImageCommand(image_path, conf_var.get(), move_var.get()))
+                try:
+                    conf_value = float(conf_var.get())
+                    conf_value = max(0.1, min(1.0, conf_value))
+                except ValueError:
+                    conf_value = 0.8
+                self.current_macro.commands.insert(insert_index, IfImageCommand(image_path, conf_value, move_var.get()))
                 # Auto-insert ENDIF right after IF IMAGE
                 self.current_macro.commands.insert(insert_index + 1, EndIfStatementCommand())
                 self.update_command_list()
                 self.save_macros()
                 dialog.destroy()
             
-            btn_frame = tk.Frame(dialog)
+            btn_frame = ctk.CTkFrame(dialog)
             btn_frame.pack(pady=20)
-            ok_btn = tk.Button(btn_frame, text="OK", command=save_options, width=10)
+            ok_btn = ctk.CTkButton(btn_frame, text="OK", command=save_options, width=100)
             ok_btn.pack(side=tk.LEFT, padx=5)
-            tk.Button(btn_frame, text="Cancel", command=dialog.destroy, width=10).pack(side=tk.LEFT, padx=5)
+            ctk.CTkButton(btn_frame, text="Cancel", command=dialog.destroy, width=100).pack(side=tk.LEFT, padx=5)
             
             # Bind Escape to cancel
             dialog.bind('<Escape>', lambda e: dialog.destroy())
             
-            # Center the dialog
-            dialog.update_idletasks()
-            width = dialog.winfo_width()
-            height = dialog.winfo_height()
-            screen_width = dialog.winfo_screenwidth()
-            screen_height = dialog.winfo_screenheight()
-            x = (screen_width - width) // 2
-            y = (screen_height - height) // 2
-            dialog.geometry(f"{width}x{height}+{x}+{y}")
+            # Auto-size and center dialog
+            schedule_autosize(dialog)
             
             self.ensure_dialog_focused(dialog)
             
-            # Re-center after a short delay
-            def recenter():
-                dialog.update_idletasks()
-                w = dialog.winfo_width()
-                h = dialog.winfo_height()
-                sw = dialog.winfo_screenwidth()
-                sh = dialog.winfo_screenheight()
-                new_x = (sw - w) // 2
-                new_y = (sh - h) // 2
-                dialog.geometry(f"{w}x{h}+{new_x}+{new_y}")
-                dialog.focus_force()
-                dialog.lift()
-                # Refocus OK button after recentering
-                ok_btn.focus_set()
-            
-            dialog.after(10, recenter)
-            dialog.after(30, recenter)
+            # Focus OK button after window appears
+            dialog.after(50, lambda: ok_btn.focus_set())
     
     def add_find_image_at_index(self, insert_index):
         """Add FIND IMAGE command at specific index"""
-        image_name = simpledialog.askstring("Image Name", "Enter name for this image:")
+        image_name = self.show_input_dialog("Image Name", "Enter name for this image:")
         if not image_name:
             return
         
@@ -3772,7 +3997,7 @@ class MacroMakerApp:
             
             self.show_image_preview(screenshot, "Captured Image")
             
-            confidence = simpledialog.askfloat("Confidence", "Enter confidence (0.0-1.0):", initialvalue=0.8)
+            confidence = self.show_input_dialog("Confidence", "Enter confidence (0.0-1.0):", 0.8, "float")
             if confidence is not None:
                 self.save_state()
                 self.current_macro.commands.insert(insert_index, FindImageCommand(image_path, confidence))
@@ -3786,7 +4011,7 @@ class MacroMakerApp:
             messagebox.showwarning("Warning", "Please select a macro first")
             return
         
-        image_name = simpledialog.askstring("Image Name", "Enter name for this image:")
+        image_name = self.show_input_dialog("Image Name", "Enter name for this image:")
         if not image_name:
             return
         
@@ -3802,32 +4027,33 @@ class MacroMakerApp:
             self.show_image_preview(screenshot, "Captured Image")
             
             # Create dialog for options
-            dialog = tk.Toplevel(self.root)
+            dialog = ctk.CTkToplevel(self.root)
             dialog.title("FIND IMAGE Options")
             dialog.transient(self.root)
             dialog.grab_set()
             
-            # Confidence slider
-            conf_frame = ttk.Frame(dialog)
-            conf_frame.pack(pady=10)
-            ttk.Label(conf_frame, text="Confidence:").pack(side=tk.LEFT, padx=5)
-            conf_var = tk.DoubleVar(value=0.8)
-            conf_scale = ttk.Scale(conf_frame, from_=0.1, to=1.0, variable=conf_var, orient=tk.HORIZONTAL, length=150)
-            conf_scale.pack(side=tk.LEFT, padx=5)
-            conf_label = ttk.Label(conf_frame, text="0.80")
-            conf_label.pack(side=tk.LEFT, padx=5)
-            
-            def update_conf_label(event=None):
-                conf_label.config(text=f"{conf_var.get():.2f}")
-            conf_scale.bind("<Motion>", update_conf_label)
-            conf_scale.bind("<ButtonRelease-1>", update_conf_label)
+            # Confidence entry
+            conf_frame = ctk.CTkFrame(dialog)
+            conf_frame.pack(pady=10, padx=10, fill=tk.X)
+            ctk.CTkLabel(conf_frame, text="Confidence (0.1-1.0):").pack(side=tk.LEFT, padx=5)
+            conf_var = tk.StringVar(value="0.80")
+            conf_entry = ctk.CTkEntry(conf_frame, textvariable=conf_var, width=80)
+            conf_entry.pack(side=tk.LEFT, padx=5)
             
             # Search within area checkbox
             search_area_var = tk.BooleanVar(value=False)
-            tk.Checkbutton(dialog, text="Search within area", variable=search_area_var).pack(pady=10)
+            search_check = ctk.CTkCheckBox(dialog, text="Search within area", variable=search_area_var)
+            search_check.pack(pady=10)
             
             # Buttons
             def save_options():
+                # Parse confidence value
+                try:
+                    conf_value = float(conf_var.get())
+                    conf_value = max(0.1, min(1.0, conf_value))
+                except ValueError:
+                    conf_value = 0.8
+                    
                 search_region = None
                 if search_area_var.get():
                     # Capture search area
@@ -3840,30 +4066,23 @@ class MacroMakerApp:
                         search_region = None
                 
                 self.save_state()
-                self.current_macro.add_command(FindImageCommand(image_path, conf_var.get(), search_region))
+                self.current_macro.add_command(FindImageCommand(image_path, conf_value, search_region))
                 self.selected_index = len(self.current_macro.commands) - 1
                 self.update_command_list()
                 self.save_macros()
                 dialog.destroy()
             
-            btn_frame = tk.Frame(dialog)
+            btn_frame = ctk.CTkFrame(dialog)
             btn_frame.pack(pady=20)
-            ok_btn = tk.Button(btn_frame, text="OK", command=save_options, width=10)
+            ok_btn = ctk.CTkButton(btn_frame, text="OK", command=save_options, width=100)
             ok_btn.pack(side=tk.LEFT, padx=5)
-            tk.Button(btn_frame, text="Cancel", command=dialog.destroy, width=10).pack(side=tk.LEFT, padx=5)
+            ctk.CTkButton(btn_frame, text="Cancel", command=dialog.destroy, width=100).pack(side=tk.LEFT, padx=5)
             
             # Bind Escape to cancel
             dialog.bind('<Escape>', lambda e: dialog.destroy())
             
-            # Center the dialog
-            dialog.update_idletasks()
-            width = dialog.winfo_width()
-            height = dialog.winfo_height()
-            screen_width = dialog.winfo_screenwidth()
-            screen_height = dialog.winfo_screenheight()
-            x = (screen_width - width) // 2
-            y = (screen_height - height) // 2
-            dialog.geometry(f"{width}x{height}+{x}+{y}")
+            # Auto-size and center dialog
+            schedule_autosize(dialog)
             
             self.ensure_dialog_focused(dialog)
     
@@ -3874,23 +4093,23 @@ class MacroMakerApp:
             return
         
         # Create dialog for message options
-        dialog = tk.Toplevel(self.root)
+        dialog = ctk.CTkToplevel(self.root)
         dialog.title("Add Message")
         dialog.transient(self.root)
         dialog.grab_set()
         
-        tk.Label(dialog, text="Enter message to display:").pack(pady=10)
+        ctk.CTkLabel(dialog, text="Enter message to display:").pack(pady=10)
         
         text_var = tk.StringVar()
-        text_entry = tk.Entry(dialog, textvariable=text_var, width=50)
+        text_entry = ctk.CTkEntry(dialog, textvariable=text_var, width=350)
         text_entry.pack(pady=5)
         text_entry.focus()
         
         always_on_top_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(dialog, text="Always on top", variable=always_on_top_var).pack(pady=5)
+        ctk.CTkCheckBox(dialog, text="Always on top", variable=always_on_top_var).pack(pady=5)
         
         always_focused_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(dialog, text="Always focused", variable=always_focused_var).pack(pady=5)
+        ctk.CTkCheckBox(dialog, text="Always focused", variable=always_focused_var).pack(pady=5)
         
         def save_message():
             text = text_var.get()
@@ -3904,49 +4123,27 @@ class MacroMakerApp:
             else:
                 messagebox.showwarning("Warning", "Please enter a message")
         
-        btn_frame = tk.Frame(dialog)
+        btn_frame = ctk.CTkFrame(dialog)
         btn_frame.pack(pady=20)
-        tk.Button(btn_frame, text="OK", command=save_message, width=10).pack(side=tk.LEFT, padx=5)
-        tk.Button(btn_frame, text="Cancel", command=dialog.destroy, width=10).pack(side=tk.LEFT, padx=5)
+        ctk.CTkButton(btn_frame, text="OK", command=save_message, width=80).pack(side=tk.LEFT, padx=5)
+        ctk.CTkButton(btn_frame, text="Cancel", command=dialog.destroy, width=80).pack(side=tk.LEFT, padx=5)
         
         # Bind Enter key to save and Escape to cancel
         text_entry.bind("<Return>", lambda e: save_message())
         dialog.bind('<Escape>', lambda e: dialog.destroy())
         
-        # Center the dialog
-        dialog.update_idletasks()
-        width = dialog.winfo_width()
-        height = dialog.winfo_height()
-        screen_width = dialog.winfo_screenwidth()
-        screen_height = dialog.winfo_screenheight()
-        x = (screen_width - width) // 2
-        y = (screen_height - height) // 2
-        dialog.geometry(f"{width}x{height}+{x}+{y}")
+        # Auto-size and center dialog
+        schedule_autosize(dialog)
         
         self.ensure_dialog_focused(dialog)
         
-        # Re-center after a short delay
-        def recenter():
-            dialog.update_idletasks()
-            w = dialog.winfo_width()
-            h = dialog.winfo_height()
-            sw = dialog.winfo_screenwidth()
-            sh = dialog.winfo_screenheight()
-            new_x = (sw - w) // 2
-            new_y = (sh - h) // 2
-            dialog.geometry(f"{w}x{h}+{new_x}+{new_y}")
-            dialog.focus_force()
-            dialog.lift()
-        
-        # Focus text field after all dialog focusing is done
+        # Focus text field after dialog appears
         def focus_text():
             text_entry.focus_set()
             text_entry.select_range(0, tk.END)
             text_entry.icursor(tk.END)
         
-        dialog.after(10, recenter)
-        dialog.after(50, recenter)
-        dialog.after(250, focus_text)
+        dialog.after(50, focus_text)
     
     def add_repeat(self, insert_index=None):
         """Add REPEAT command"""
@@ -3954,7 +4151,7 @@ class MacroMakerApp:
             messagebox.showwarning("Warning", "Please select a macro first")
             return
         
-        count = simpledialog.askinteger("REPEAT", "Enter number of repetitions:")
+        count = self.show_input_dialog("REPEAT", "Enter number of repetitions:", 1, "int")
         if count is not None:
             self.save_state()
             cmd = RepeatCommand(count)
@@ -3990,7 +4187,7 @@ class MacroMakerApp:
             messagebox.showwarning("Warning", "Please select a macro first")
             return
         
-        seconds = simpledialog.askfloat("Delay", "Enter delay in seconds:")
+        seconds = self.show_input_dialog("Delay", "Enter delay in seconds:", 0.1, "float")
         if seconds is not None:
             self.save_state()
             cmd = DelayCommand(seconds)
@@ -4009,7 +4206,7 @@ class MacroMakerApp:
             messagebox.showwarning("Warning", "Please select a macro first")
             return
         
-        milliseconds = simpledialog.askinteger("Delay (ms)", "Enter delay in milliseconds:")
+        milliseconds = self.show_input_dialog("Delay (ms)", "Enter delay in milliseconds:", 100, "int")
         if milliseconds is not None:
             self.save_state()
             cmd = DelayMsCommand(milliseconds)
@@ -4028,9 +4225,9 @@ class MacroMakerApp:
             messagebox.showwarning("Warning", "Please select a macro first")
             return
         
-        pattern = simpledialog.askstring("Wait For Window", "Enter window title pattern (use * as wildcard):")
+        pattern = self.show_input_dialog("Wait For Window", "Enter window title pattern (use * as wildcard):")
         if pattern:
-            timeout = simpledialog.askinteger("Timeout", "Enter timeout in seconds:", initialvalue=30)
+            timeout = self.show_input_dialog("Timeout", "Enter timeout in seconds:", 30, "int")
             if timeout is not None:
                 self.save_state()
                 self.current_macro.add_command(WaitForWindowCommand(pattern, timeout))
@@ -4044,9 +4241,9 @@ class MacroMakerApp:
             messagebox.showwarning("Warning", "Please select a macro first")
             return
         
-        pattern = simpledialog.askstring("Wait For Window", "Enter window title pattern (use * as wildcard):")
+        pattern = self.show_input_dialog("Wait For Window", "Enter window title pattern (use * as wildcard):")
         if pattern:
-            timeout = simpledialog.askinteger("Timeout", "Enter timeout in seconds:", initialvalue=30)
+            timeout = self.show_input_dialog("Timeout", "Enter timeout in seconds:", 30, "int")
             if timeout is not None:
                 self.save_state()
                 self.current_macro.commands.insert(insert_index, WaitForWindowCommand(pattern, timeout))
@@ -4061,23 +4258,23 @@ class MacroMakerApp:
             return
         
         # Create dialog for message options
-        dialog = tk.Toplevel(self.root)
+        dialog = ctk.CTkToplevel(self.root)
         dialog.title("Add Message")
         dialog.transient(self.root)
         dialog.grab_set()
         
-        tk.Label(dialog, text="Enter message to display:").pack(pady=10)
+        ctk.CTkLabel(dialog, text="Enter message to display:").pack(pady=10)
         
         text_var = tk.StringVar()
-        text_entry = tk.Entry(dialog, textvariable=text_var, width=50)
+        text_entry = ctk.CTkEntry(dialog, textvariable=text_var, width=350)
         text_entry.pack(pady=5)
         text_entry.focus()
         
         always_on_top_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(dialog, text="Always on top", variable=always_on_top_var).pack(pady=5)
+        ctk.CTkCheckBox(dialog, text="Always on top", variable=always_on_top_var).pack(pady=5)
         
         always_focused_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(dialog, text="Always focused", variable=always_focused_var).pack(pady=5)
+        ctk.CTkCheckBox(dialog, text="Always focused", variable=always_focused_var).pack(pady=5)
         
         def save_message():
             text = text_var.get()
@@ -4091,22 +4288,16 @@ class MacroMakerApp:
             else:
                 messagebox.showwarning("Warning", "Please enter a message")
         
-        btn_frame = tk.Frame(dialog)
+        btn_frame = ctk.CTkFrame(dialog)
         btn_frame.pack(pady=20)
-        tk.Button(btn_frame, text="OK", command=save_message, width=10).pack(side=tk.LEFT, padx=5)
-        tk.Button(btn_frame, text="Cancel", command=dialog.destroy, width=10).pack(side=tk.LEFT, padx=5)
+        ctk.CTkButton(btn_frame, text="OK", command=save_message, width=80).pack(side=tk.LEFT, padx=5)
+        ctk.CTkButton(btn_frame, text="Cancel", command=dialog.destroy, width=80).pack(side=tk.LEFT, padx=5)
         
         text_entry.bind("<Return>", lambda e: save_message())
         dialog.bind('<Escape>', lambda e: dialog.destroy())
         
-        dialog.update_idletasks()
-        width = dialog.winfo_width()
-        height = dialog.winfo_height()
-        screen_width = dialog.winfo_screenwidth()
-        screen_height = dialog.winfo_screenheight()
-        x = (screen_width - width) // 2
-        y = (screen_height - height) // 2
-        dialog.geometry(f"{width}x{height}+{x}+{y}")
+        # Auto-size and center dialog
+        schedule_autosize(dialog)
         self.ensure_dialog_focused(dialog)
     
     def add_clipboard_clear(self, insert_index=None):
@@ -4132,7 +4323,7 @@ class MacroMakerApp:
             messagebox.showwarning("Warning", "Please select a macro first")
             return
         
-        value = simpledialog.askstring("Clipboard Set", "Enter value to copy to clipboard:")
+        value = self.show_input_dialog("Clipboard Set", "Enter value to copy to clipboard:")
         if value is not None:
             self.save_state()
             cmd = ClipboardSetCommand(value)
@@ -4195,6 +4386,103 @@ class MacroMakerApp:
             self.selected_index = len(self.current_macro.commands) - 1
         self.update_command_list()
         self.save_macros()
+    
+    def add_capture_screen(self, insert_index=None):
+        """Add capture screen command"""
+        if not self.current_macro:
+            messagebox.showwarning("Warning", "Please select a macro first")
+            return
+        
+        # Show instructions
+        messagebox.showinfo("Capture Region", "Click and drag to select the screen region to capture.")
+        
+        # Capture the region coordinates
+        result = self.capture_screen_region()
+        if result:
+            _, region = result
+            if region:
+                x1, y1, x2, y2 = region
+                self.save_state()
+                cmd = CaptureScreenCommand(x1, y1, x2, y2)
+                if insert_index is not None:
+                    self.current_macro.commands.insert(insert_index, cmd)
+                    self.selected_index = insert_index
+                else:
+                    self.current_macro.add_command(cmd)
+                    self.selected_index = len(self.current_macro.commands) - 1
+                self.update_command_list()
+                self.save_macros()
+    
+    def add_clipboard_edit(self, insert_index=None):
+        """Add clipboard edit command"""
+        if not self.current_macro:
+            messagebox.showwarning("Warning", "Please select a macro first")
+            return
+        
+        # Create dialog for selecting edit operation
+        dialog = ctk.CTkToplevel(self.root)
+        dialog.title("Clipboard Edit")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        result = {"operation": None}
+        
+        ctk.CTkLabel(dialog, text="Select clipboard edit operation:", font=("Arial", 12, "bold")).pack(pady=20)
+        
+        def select_operation(op):
+            result["operation"] = op
+            dialog.grab_release()
+            dialog.destroy()
+        
+        btn_frame = ctk.CTkFrame(dialog)
+        btn_frame.pack(pady=10, padx=20, fill=tk.BOTH, expand=True)
+        
+        ctk.CTkButton(
+            btn_frame,
+            text="Remove Spaces",
+            command=lambda: select_operation("remove_spaces"),
+            width=250,
+            height=40
+        ).pack(pady=5)
+        
+        ctk.CTkButton(
+            btn_frame,
+            text="Remove Indents",
+            command=lambda: select_operation("remove_indents"),
+            width=250,
+            height=40
+        ).pack(pady=5)
+        
+        ctk.CTkButton(
+            btn_frame,
+            text="Proper Case",
+            command=lambda: select_operation("proper"),
+            width=250,
+            height=40
+        ).pack(pady=5)
+        
+        def cancel():
+            dialog.grab_release()
+            dialog.destroy()
+        
+        ctk.CTkButton(dialog, text="Cancel", command=cancel, width=100).pack(pady=10)
+        
+        # Auto-size and center dialog
+        schedule_autosize(dialog)
+        
+        dialog.wait_window()
+        
+        if result["operation"]:
+            self.save_state()
+            cmd = ClipboardEditCommand(result["operation"])
+            if insert_index is not None:
+                self.current_macro.commands.insert(insert_index, cmd)
+                self.selected_index = insert_index
+            else:
+                self.current_macro.add_command(cmd)
+                self.selected_index = len(self.current_macro.commands) - 1
+            self.update_command_list()
+            self.save_macros()
     
     def add_sound(self, insert_index=None):
         """Add sound command"""
@@ -4273,6 +4561,16 @@ class MacroMakerApp:
             self.save_macros()
         return "break"
     
+    def on_delete_press(self, event):
+        """Handle Delete key press - only delete once per press"""
+        if not self.delete_key_pressed:
+            self.delete_key_pressed = True
+            self.remove_command()
+    
+    def on_delete_release(self, event):
+        """Handle Delete key release"""
+        self.delete_key_pressed = False
+    
     def remove_command(self):
         """Remove selected command"""
         if not self.current_macro:
@@ -4313,7 +4611,7 @@ class MacroMakerApp:
         except ValueError:
             repeat_count = 1
         
-        self.status_label.config(text="Running...")
+        self.status_label.configure(text="Running...")
         
         def progress_callback(index):
             self.root.after(0, lambda: self.highlight_command(index))
@@ -4321,7 +4619,7 @@ class MacroMakerApp:
         def run():
             self.executor.execute(self.current_macro, repeat_count, progress_callback)
             self.root.after(0, lambda: self.highlight_command(-1))  # Reset highlight
-            self.status_label.config(text="Ready")
+            self.root.after(0, lambda: self.status_label.configure(text="Ready"))
         
         threading.Thread(target=run, daemon=True).start()
     
@@ -4329,8 +4627,8 @@ class MacroMakerApp:
         """Stop the running macro"""
         if self.executor.running:
             self.executor.stop()
-            self.highlight_command(-1)  # Reset highlight
-            self.status_label.config(text="Stopped")
+            self.root.after(0, lambda: self.highlight_command(-1))  # Reset highlight
+            self.root.after(0, lambda: self.status_label.configure(text="Stopped"))
     
     def save_macros(self):
         """Save all macros to file"""
@@ -4372,6 +4670,24 @@ class MacroMakerApp:
             except Exception as e:
                 print(f"Error loading macros: {e}")
     
+    def _lighten_color(self, hex_color, factor=0.3):
+        """Lighten a hex color by mixing with white"""
+        # Remove '#' if present
+        hex_color = hex_color.lstrip('#')
+        
+        # Convert hex to RGB
+        r = int(hex_color[0:2], 16)
+        g = int(hex_color[2:4], 16)
+        b = int(hex_color[4:6], 16)
+        
+        # Mix with white
+        r = int(r + (255 - r) * factor)
+        g = int(g + (255 - g) * factor)
+        b = int(b + (255 - b) * factor)
+        
+        # Convert back to hex
+        return f'#{r:02x}{g:02x}{b:02x}'
+    
     def _create_thumbnail(self, parent, image_path):
         """Create a thumbnail label for an image"""
         try:
@@ -4403,7 +4719,7 @@ class MacroMakerApp:
     
     def show_image_preview(self, image, title="Image Preview"):
         """Show a preview of the captured image"""
-        preview_window = tk.Toplevel(self.root)
+        preview_window = ctk.CTkToplevel(self.root)
         preview_window.title(title)
         preview_window.transient(self.root)
         preview_window.grab_set()
@@ -4421,47 +4737,26 @@ class MacroMakerApp:
         img.save(img_byte_arr, format='PNG')
         img_byte_arr.seek(0)
         
-        # Create label with image
+        # Create label with image (using CTkLabel with image)
         photo = tk.PhotoImage(data=img_byte_arr.getvalue())
-        label = tk.Label(preview_window, image=photo)
+        label = ctk.CTkLabel(preview_window, image=photo, text="")
         label.image = photo  # Keep a reference
         label.pack(padx=10, pady=10)
         
         # Add OK button
-        ok_btn = ttk.Button(preview_window, text="OK", command=preview_window.destroy)
+        ok_btn = ctk.CTkButton(preview_window, text="OK", command=preview_window.destroy, width=80)
         ok_btn.pack(pady=10)
         
-        # Update and center the window
-        preview_window.update_idletasks()
-        width = preview_window.winfo_width()
-        height = preview_window.winfo_height()
-        screen_width = preview_window.winfo_screenwidth()
-        screen_height = preview_window.winfo_screenheight()
-        x = (screen_width - width) // 2
-        y = (screen_height - height) // 2
-        preview_window.geometry(f"+{x}+{y}")
+        # Auto-size and center dialog
+        schedule_autosize(preview_window)
         
         # Focus and bring to top
         preview_window.attributes('-topmost', True)
         preview_window.focus_force()
         preview_window.lift()
         
-        # Re-center and focus after a short delay
-        def recenter_and_focus():
-            w = preview_window.winfo_width()
-            h = preview_window.winfo_height()
-            sw = preview_window.winfo_screenwidth()
-            sh = preview_window.winfo_screenheight()
-            new_x = (sw - w) // 2
-            new_y = (sh - h) // 2
-            preview_window.geometry(f"+{new_x}+{new_y}")
-            preview_window.focus_force()
-            preview_window.lift()
-            # Refocus OK button after recentering
-            ok_btn.focus_set()
-        
-        preview_window.after(50, recenter_and_focus)
-        preview_window.after(100, recenter_and_focus)
+        # Focus OK button after dialog appears
+        preview_window.after(50, lambda: ok_btn.focus_set())
         
         # Wait for window to close before continuing
         preview_window.wait_window()
@@ -4501,7 +4796,7 @@ class MacroMakerApp:
                 self.save_macros()
         
         elif isinstance(cmd, DelayCommand):
-            new_delay = simpledialog.askfloat("Edit Delay", "Enter delay in seconds:", initialvalue=cmd.seconds)
+            new_delay = self.show_input_dialog("Edit Delay", "Enter delay in seconds:", cmd.seconds, "float")
             if new_delay is not None:
                 self.save_state()
                 cmd.seconds = new_delay
@@ -4512,7 +4807,7 @@ class MacroMakerApp:
             self.edit_message_command(cmd)
         
         elif isinstance(cmd, RepeatCommand):
-            new_count = simpledialog.askinteger("Edit Repeat", "Enter repeat count:", initialvalue=cmd.count)
+            new_count = self.show_input_dialog("Edit Repeat", "Enter repeat count:", cmd.count, "int")
             if new_count is not None:
                 self.save_state()
                 cmd.count = new_count
@@ -4521,37 +4816,30 @@ class MacroMakerApp:
         
         elif isinstance(cmd, (IfImageCommand, FindImageCommand)):
             # Create dialog for editing image command
-            print(f"DEBUG: About to call edit_image_command")
-            try:
-                self.edit_image_command(cmd, index)
-                print(f"DEBUG: edit_image_command completed")
-            except Exception as e:
-                print(f"DEBUG: Exception in edit_image_command: {e}")
-                import traceback
-                traceback.print_exc()
+            self.edit_image_command(cmd, index)
         
         return "break"  # Prevent event propagation
     
     def edit_message_command(self, cmd):
         """Edit a message command"""
         # Create dialog for editing message
-        dialog = tk.Toplevel(self.root)
+        dialog = ctk.CTkToplevel(self.root)
         dialog.title("Edit Message")
         dialog.transient(self.root)
         dialog.grab_set()
         
-        tk.Label(dialog, text="Enter message:").pack(pady=10)
+        ctk.CTkLabel(dialog, text="Enter message:").pack(pady=10)
         
         text_var = tk.StringVar(value=cmd.text)
-        text_entry = tk.Entry(dialog, textvariable=text_var, width=50)
+        text_entry = ctk.CTkEntry(dialog, textvariable=text_var, width=350)
         text_entry.pack(pady=5)
         text_entry.focus()
         
         always_on_top_var = tk.BooleanVar(value=cmd.always_on_top)
-        tk.Checkbutton(dialog, text="Always on top", variable=always_on_top_var).pack(pady=5)
+        ctk.CTkCheckBox(dialog, text="Always on top", variable=always_on_top_var).pack(pady=5)
         
         always_focused_var = tk.BooleanVar(value=cmd.always_focused)
-        tk.Checkbutton(dialog, text="Always focused", variable=always_focused_var).pack(pady=5)
+        ctk.CTkCheckBox(dialog, text="Always focused", variable=always_focused_var).pack(pady=5)
         
         def save_changes():
             text = text_var.get()
@@ -4566,68 +4854,46 @@ class MacroMakerApp:
             else:
                 messagebox.showwarning("Warning", "Please enter a message")
         
-        btn_frame = tk.Frame(dialog)
+        btn_frame = ctk.CTkFrame(dialog)
         btn_frame.pack(pady=20)
-        tk.Button(btn_frame, text="OK", command=save_changes, width=10).pack(side=tk.LEFT, padx=5)
-        tk.Button(btn_frame, text="Cancel", command=dialog.destroy, width=10).pack(side=tk.LEFT, padx=5)
+        ctk.CTkButton(btn_frame, text="OK", command=save_changes, width=80).pack(side=tk.LEFT, padx=5)
+        ctk.CTkButton(btn_frame, text="Cancel", command=dialog.destroy, width=80).pack(side=tk.LEFT, padx=5)
         
         # Bind Enter key to save and Escape to cancel
         text_entry.bind("<Return>", lambda e: save_changes())
         dialog.bind('<Escape>', lambda e: dialog.destroy())
         
-        # Center the dialog
-        dialog.update_idletasks()
-        width = dialog.winfo_width()
-        height = dialog.winfo_height()
-        screen_width = dialog.winfo_screenwidth()
-        screen_height = dialog.winfo_screenheight()
-        x = (screen_width - width) // 2
-        y = (screen_height - height) // 2
-        dialog.geometry(f"{width}x{height}+{x}+{y}")
+        # Auto-size and center dialog
+        schedule_autosize(dialog)
         
         self.ensure_dialog_focused(dialog)
         
-        # Re-center after a short delay
-        def recenter():
-            dialog.update_idletasks()
-            w = dialog.winfo_width()
-            h = dialog.winfo_height()
-            sw = dialog.winfo_screenwidth()
-            sh = dialog.winfo_screenheight()
-            new_x = (sw - w) // 2
-            new_y = (sh - h) // 2
-            dialog.geometry(f"{w}x{h}+{new_x}+{new_y}")
-            dialog.focus_force()
-            dialog.lift()
-        
-        # Focus text field after all dialog focusing is done
+        # Focus text field after dialog appears
         def focus_text():
             text_entry.focus_set()
             text_entry.select_range(0, tk.END)
             text_entry.icursor(tk.END)
         
-        dialog.after(10, recenter)
-        dialog.after(30, recenter)
         dialog.after(80, focus_text)
     
     def edit_image_command(self, cmd, index):
         """Edit an image command with preview and multiple images support"""
-        dialog = tk.Toplevel(self.root)
+        dialog = ctk.CTkToplevel(self.root)
         dialog.title("Edit Image Command")
         dialog.transient(self.root)
         dialog.grab_set()
         
         # For IF IMAGE commands, show list of images
         if isinstance(cmd, IfImageCommand):
-            tk.Label(dialog, text="Images (will search for any of these):", font=("Arial", 10, "bold")).pack(pady=10)
+            ctk.CTkLabel(dialog, text="Images (will search for any of these):", font=("Arial", 12, "bold")).pack(pady=10)
             
             # Create scrollable frame for images
-            list_frame = ttk.Frame(dialog)
+            list_frame = ctk.CTkFrame(dialog)
             list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
             
-            canvas = tk.Canvas(list_frame, height=300)
-            scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=canvas.yview)
-            scrollable_frame = ttk.Frame(canvas)
+            canvas = tk.Canvas(list_frame, height=300, bg="#2b2b2b", highlightthickness=0)
+            scrollbar = ctk.CTkScrollbar(list_frame, orientation="vertical", command=canvas.yview)
+            scrollable_frame = ctk.CTkFrame(canvas)
             
             scrollable_frame.bind(
                 "<Configure>",
@@ -4650,7 +4916,7 @@ class MacroMakerApp:
                 image_frames.clear()
                 
                 for idx, img_info in enumerate(cmd.image_paths):
-                    frame = ttk.Frame(scrollable_frame, relief="solid", borderwidth=1)
+                    frame = ctk.CTkFrame(scrollable_frame)
                     frame.pack(fill=tk.X, padx=5, pady=5)
                     
                     # Try to show thumbnail
@@ -4662,82 +4928,58 @@ class MacroMakerApp:
                         img.save(img_byte_arr, format='PNG')
                         img_byte_arr.seek(0)
                         photo = tk.PhotoImage(data=img_byte_arr.getvalue())
-                        label = tk.Label(frame, image=photo)
+                        label = tk.Label(frame, image=photo, bg="#2b2b2b")
                         label.image = photo
                         label.pack(side=tk.LEFT, padx=5)
                     except:
-                        tk.Label(frame, text="[No Image]", width=15).pack(side=tk.LEFT, padx=5)
+                        ctk.CTkLabel(frame, text="[No Image]", width=100).pack(side=tk.LEFT, padx=5)
                     
-                    info_frame = ttk.Frame(frame)
+                    info_frame = ctk.CTkFrame(frame)
                     info_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5)
                     
-                    tk.Label(info_frame, text=Path(img_info["path"]).stem, font=("Arial", 9, "bold")).pack(anchor="w")
-                    tk.Label(info_frame, text=f"Confidence: {img_info['confidence']:.2f}").pack(anchor="w")
+                    ctk.CTkLabel(info_frame, text=Path(img_info["path"]).stem, font=("Arial", 10, "bold")).pack(anchor="w")
+                    ctk.CTkLabel(info_frame, text=f"Confidence: {img_info['confidence']:.2f}").pack(anchor="w")
                     
-                    btn_frame = ttk.Frame(frame)
+                    btn_frame = ctk.CTkFrame(frame)
                     btn_frame.pack(side=tk.RIGHT, padx=5)
                     
                     def make_edit_func(img_idx):
                         def edit_img():
                             # Create mini dialog to edit confidence
-                            edit_dlg = tk.Toplevel(dialog)
+                            edit_dlg = ctk.CTkToplevel(dialog)
                             edit_dlg.title("Edit Image Settings")
                             edit_dlg.transient(dialog)
                             edit_dlg.grab_set()
                             
-                            tk.Label(edit_dlg, text="Confidence:").pack(pady=10)
-                            conf_var = tk.DoubleVar(value=cmd.image_paths[img_idx]["confidence"])
-                            conf_scale = ttk.Scale(edit_dlg, from_=0.1, to=1.0, variable=conf_var, orient=tk.HORIZONTAL, length=200)
-                            conf_scale.pack(pady=5)
-                            conf_label = tk.Label(edit_dlg, text=f"{cmd.image_paths[img_idx]['confidence']:.2f}")
-                            conf_label.pack()
-                            
-                            def update_conf_label(event=None):
-                                conf_label.config(text=f"{conf_var.get():.2f}")
-                            conf_scale.bind("<Motion>", update_conf_label)
-                            conf_scale.bind("<ButtonRelease-1>", update_conf_label)
+                            ctk.CTkLabel(edit_dlg, text="Confidence (0.1-1.0):").pack(pady=10)
+                            conf_var = tk.StringVar(value=f"{cmd.image_paths[img_idx]['confidence']:.2f}")
+                            conf_entry = ctk.CTkEntry(edit_dlg, textvariable=conf_var, width=100)
+                            conf_entry.pack(pady=5)
                             
                             def save_conf():
-                                cmd.image_paths[img_idx]["confidence"] = conf_var.get()
+                                try:
+                                    conf_value = float(conf_var.get())
+                                    conf_value = max(0.1, min(1.0, conf_value))
+                                except ValueError:
+                                    conf_value = 0.8
+                                cmd.image_paths[img_idx]["confidence"] = conf_value
                                 # Update primary confidence if editing first image
                                 if img_idx == 0:
-                                    cmd.confidence = conf_var.get()
+                                    cmd.confidence = conf_value
                                 self.save_state()
                                 self.save_macros()
                                 edit_dlg.destroy()
                                 refresh_image_list()
                             
-                            save_btn = ttk.Button(edit_dlg, text="Save", command=save_conf)
+                            save_btn = ctk.CTkButton(edit_dlg, text="Save", command=save_conf, width=100)
                             save_btn.pack(pady=10)
                             
-                            # Center and focus the dialog
-                            edit_dlg.update_idletasks()
-                            width = edit_dlg.winfo_width()
-                            height = edit_dlg.winfo_height()
-                            screen_width = edit_dlg.winfo_screenwidth()
-                            screen_height = edit_dlg.winfo_screenheight()
-                            x = (screen_width - width) // 2
-                            y = (screen_height - height) // 2
-                            edit_dlg.geometry(f"{width}x{height}+{x}+{y}")
+                            # Auto-size and center dialog
+                            schedule_autosize(edit_dlg)
                             self.ensure_dialog_focused(edit_dlg)
                             
-                            # Re-center after a short delay
-                            def recenter_edit():
-                                edit_dlg.update_idletasks()
-                                w = edit_dlg.winfo_width()
-                                h = edit_dlg.winfo_height()
-                                sw = edit_dlg.winfo_screenwidth()
-                                sh = edit_dlg.winfo_screenheight()
-                                new_x = (sw - w) // 2
-                                new_y = (sh - h) // 2
-                                edit_dlg.geometry(f"{w}x{h}+{new_x}+{new_y}")
-                                edit_dlg.focus_force()
-                                edit_dlg.lift()
-                                # Refocus Save button after recentering
-                                save_btn.focus_set()
-                            
-                            edit_dlg.after(10, recenter_edit)
-                            edit_dlg.after(30, recenter_edit)
+                            # Focus save button after dialog appears
+                            edit_dlg.after(50, lambda: save_btn.focus_set())
                         return edit_img
                     
                     def make_remove_func(img_idx):
@@ -4755,8 +4997,8 @@ class MacroMakerApp:
                                 messagebox.showwarning("Warning", "Cannot remove the last image")
                         return remove_img
                     
-                    ttk.Button(btn_frame, text="Edit", command=make_edit_func(idx), width=8).pack(pady=2)
-                    ttk.Button(btn_frame, text="Remove", command=make_remove_func(idx), width=8).pack(pady=2)
+                    ctk.CTkButton(btn_frame, text="Edit", command=make_edit_func(idx), width=70).pack(pady=2)
+                    ctk.CTkButton(btn_frame, text="Remove", command=make_remove_func(idx), width=70).pack(pady=2)
                     
                     image_frames.append(frame)
             
@@ -4765,14 +5007,14 @@ class MacroMakerApp:
             # Add new image button
             def add_new_image():
                 # Custom dialog for image name
-                name_dlg = tk.Toplevel(dialog)
+                name_dlg = ctk.CTkToplevel(dialog)
                 name_dlg.title("Image Name")
                 name_dlg.transient(dialog)
                 name_dlg.grab_set()
                 
-                tk.Label(name_dlg, text="Enter name for this image:").pack(pady=10, padx=20)
+                ctk.CTkLabel(name_dlg, text="Enter name for this image:").pack(pady=10, padx=20)
                 name_var = tk.StringVar()
-                entry = tk.Entry(name_dlg, textvariable=name_var, width=30)
+                entry = ctk.CTkEntry(name_dlg, textvariable=name_var, width=200)
                 entry.pack(pady=5, padx=20)
                 
                 result = {'confirmed': False}
@@ -4787,43 +5029,21 @@ class MacroMakerApp:
                 entry.bind('<Return>', lambda e: on_ok())
                 entry.bind('<Escape>', lambda e: on_cancel())
                 
-                btn_frame = tk.Frame(name_dlg)
+                btn_frame = ctk.CTkFrame(name_dlg)
                 btn_frame.pack(pady=10)
-                ttk.Button(btn_frame, text="OK", command=on_ok).pack(side=tk.LEFT, padx=5)
-                ttk.Button(btn_frame, text="Cancel", command=on_cancel).pack(side=tk.LEFT, padx=5)
+                ctk.CTkButton(btn_frame, text="OK", command=on_ok, width=80).pack(side=tk.LEFT, padx=5)
+                ctk.CTkButton(btn_frame, text="Cancel", command=on_cancel, width=80).pack(side=tk.LEFT, padx=5)
                 
-                # Center and focus
-                name_dlg.update_idletasks()
-                width = name_dlg.winfo_width()
-                height = name_dlg.winfo_height()
-                screen_width = name_dlg.winfo_screenwidth()
-                screen_height = name_dlg.winfo_screenheight()
-                x = (screen_width - width) // 2
-                y = (screen_height - height) // 2
-                name_dlg.geometry(f"{width}x{height}+{x}+{y}")
+                # Auto-size and center dialog
+                schedule_autosize(name_dlg)
                 self.ensure_dialog_focused(name_dlg)
                 
-                # Re-center after a short delay
-                def recenter_name():
-                    name_dlg.update_idletasks()
-                    w = name_dlg.winfo_width()
-                    h = name_dlg.winfo_height()
-                    sw = name_dlg.winfo_screenwidth()
-                    sh = name_dlg.winfo_screenheight()
-                    new_x = (sw - w) // 2
-                    new_y = (sh - h) // 2
-                    name_dlg.geometry(f"{w}x{h}+{new_x}+{new_y}")
-                    name_dlg.focus_force()
-                    name_dlg.lift()
-                
-                # Focus text field after all dialog focusing is done
+                # Focus entry field after dialog appears
                 def focus_entry():
                     entry.focus_set()
                     entry.select_range(0, tk.END)
                     entry.icursor(tk.END)
                 
-                name_dlg.after(10, recenter_name)
-                name_dlg.after(30, recenter_name)
                 name_dlg.after(80, focus_entry)
                 
                 name_dlg.wait_window()
@@ -4841,22 +5061,15 @@ class MacroMakerApp:
                     self.show_image_preview(screenshot, "Captured Image")
                     
                     # Custom dialog for confidence
-                    conf_dlg = tk.Toplevel(dialog)
+                    conf_dlg = ctk.CTkToplevel(dialog)
                     conf_dlg.title("Confidence")
                     conf_dlg.transient(dialog)
                     conf_dlg.grab_set()
                     
-                    tk.Label(conf_dlg, text="Enter confidence (0.0-1.0):").pack(pady=10, padx=20)
-                    conf_var = tk.DoubleVar(value=0.8)
-                    conf_scale = ttk.Scale(conf_dlg, from_=0.1, to=1.0, variable=conf_var, orient=tk.HORIZONTAL, length=200)
-                    conf_scale.pack(pady=5, padx=20)
-                    conf_label = tk.Label(conf_dlg, text="0.80")
-                    conf_label.pack(pady=5)
-                    
-                    def update_conf_label(event=None):
-                        conf_label.config(text=f"{conf_var.get():.2f}")
-                    conf_scale.bind("<Motion>", update_conf_label)
-                    conf_scale.bind("<ButtonRelease-1>", update_conf_label)
+                    ctk.CTkLabel(conf_dlg, text="Enter confidence (0.1-1.0):").pack(pady=10, padx=20)
+                    conf_var = tk.StringVar(value="0.80")
+                    conf_entry = ctk.CTkEntry(conf_dlg, textvariable=conf_var, width=100)
+                    conf_entry.pack(pady=5, padx=20)
                     
                     conf_result = {'confirmed': False}
                     
@@ -4867,48 +5080,31 @@ class MacroMakerApp:
                     def on_conf_cancel():
                         conf_dlg.destroy()
                     
-                    btn_frame = tk.Frame(conf_dlg)
+                    btn_frame = ctk.CTkFrame(conf_dlg)
                     btn_frame.pack(pady=10)
-                    ok_btn = ttk.Button(btn_frame, text="OK", command=on_conf_ok)
+                    ok_btn = ctk.CTkButton(btn_frame, text="OK", command=on_conf_ok, width=80)
                     ok_btn.pack(side=tk.LEFT, padx=5)
-                    ttk.Button(btn_frame, text="Cancel", command=on_conf_cancel).pack(side=tk.LEFT, padx=5)
+                    ctk.CTkButton(btn_frame, text="Cancel", command=on_conf_cancel, width=80).pack(side=tk.LEFT, padx=5)
                     
                     # Bind Escape to cancel
                     conf_dlg.bind('<Escape>', lambda e: on_conf_cancel())
                     
-                    # Center and focus
-                    conf_dlg.update_idletasks()
-                    width = conf_dlg.winfo_width()
-                    height = conf_dlg.winfo_height()
-                    screen_width = conf_dlg.winfo_screenwidth()
-                    screen_height = conf_dlg.winfo_screenheight()
-                    x = (screen_width - width) // 2
-                    y = (screen_height - height) // 2
-                    conf_dlg.geometry(f"{width}x{height}+{x}+{y}")
+                    # Auto-size and center dialog
+                    schedule_autosize(conf_dlg)
                     self.ensure_dialog_focused(conf_dlg)
                     
-                    # Re-center after a short delay
-                    def recenter_conf():
-                        conf_dlg.update_idletasks()
-                        w = conf_dlg.winfo_width()
-                        h = conf_dlg.winfo_height()
-                        sw = conf_dlg.winfo_screenwidth()
-                        sh = conf_dlg.winfo_screenheight()
-                        new_x = (sw - w) // 2
-                        new_y = (sh - h) // 2
-                        conf_dlg.geometry(f"{w}x{h}+{new_x}+{new_y}")
-                        conf_dlg.focus_force()
-                        conf_dlg.lift()
-                        # Refocus OK button after recentering
-                        ok_btn.focus_set()
-                    
-                    conf_dlg.after(10, recenter_conf)
-                    conf_dlg.after(30, recenter_conf)
+                    # Focus OK button after dialog appears
+                    conf_dlg.after(50, lambda: ok_btn.focus_set())
                     
                     conf_dlg.wait_window()
                     
                     if conf_result['confirmed']:
-                        cmd.image_paths.append({"path": image_path, "confidence": conf_var.get()})
+                        try:
+                            conf_value = float(conf_var.get())
+                            conf_value = max(0.1, min(1.0, conf_value))
+                        except ValueError:
+                            conf_value = 0.8
+                        cmd.image_paths.append({"path": image_path, "confidence": conf_value})
                         # Update primary image_path and confidence for backwards compatibility
                         if not cmd.image_path or len(cmd.image_paths) == 1:
                             cmd.image_path = cmd.image_paths[0]["path"]
@@ -4917,14 +5113,15 @@ class MacroMakerApp:
                         self.save_macros()
                         refresh_image_list()
             
-            ttk.Button(dialog, text="Add Additional Image", command=add_new_image).pack(pady=10)
+            ctk.CTkButton(dialog, text="Add Additional Image", command=add_new_image).pack(pady=10)
             
             # Move to image checkbox
             move_var = tk.BooleanVar(value=cmd.move_to_image)
-            tk.Checkbutton(dialog, text="Move mouse to image if found", variable=move_var).pack(pady=10)
+            move_check = ctk.CTkCheckBox(dialog, text="Move mouse to image if found", variable=move_var)
+            move_check.pack(pady=10)
             
             # Save/Cancel buttons
-            btn_frame = ttk.Frame(dialog)
+            btn_frame = ctk.CTkFrame(dialog)
             btn_frame.pack(pady=20)
             
             def save_changes():
@@ -4936,44 +5133,27 @@ class MacroMakerApp:
                     cmd.confidence = cmd.image_paths[0]["confidence"]
                 self.update_command_list()
                 self.save_macros()
+                dialog.grab_release()
                 dialog.destroy()
             
-            save_btn = ttk.Button(btn_frame, text="Save", command=save_changes)
+            def cancel_dialog():
+                dialog.grab_release()
+                dialog.destroy()
+            
+            save_btn = ctk.CTkButton(btn_frame, text="Save", command=save_changes, width=80)
             save_btn.pack(side=tk.LEFT, padx=5)
-            ttk.Button(btn_frame, text="Cancel", command=dialog.destroy).pack(side=tk.LEFT, padx=5)
+            ctk.CTkButton(btn_frame, text="Cancel", command=cancel_dialog, width=80).pack(side=tk.LEFT, padx=5)
             
             # Bind Escape to cancel
-            dialog.bind('<Escape>', lambda e: dialog.destroy())
+            dialog.bind('<Escape>', lambda e: cancel_dialog())
             
-            # Center the dialog
-            dialog.update_idletasks()
-            width = dialog.winfo_width()
-            height = dialog.winfo_height()
-            screen_width = dialog.winfo_screenwidth()
-            screen_height = dialog.winfo_screenheight()
-            x = (screen_width - width) // 2
-            y = (screen_height - height) // 2
-            dialog.geometry(f"{width}x{height}+{x}+{y}")
+            # Auto-size and center dialog
+            schedule_autosize(dialog)
             
             self.ensure_dialog_focused(dialog)
             
-            # Re-center after a short delay
-            def recenter():
-                dialog.update_idletasks()
-                w = dialog.winfo_width()
-                h = dialog.winfo_height()
-                sw = dialog.winfo_screenwidth()
-                sh = dialog.winfo_screenheight()
-                new_x = (sw - w) // 2
-                new_y = (sh - h) // 2
-                dialog.geometry(f"{w}x{h}+{new_x}+{new_y}")
-                dialog.focus_force()
-                dialog.lift()
-                # Refocus Save button after recentering
-                save_btn.focus_set()
-            
-            dialog.after(10, recenter)
-            dialog.after(30, recenter)
+            # Focus save button after dialog appears
+            dialog.after(50, lambda: save_btn.focus_set())
         
         else:
             # FIND IMAGE command - single image only
@@ -4991,27 +5171,19 @@ class MacroMakerApp:
                 label.image = photo
                 label.pack(padx=10, pady=10)
             except:
-                tk.Label(dialog, text="Image not found", fg="red").pack(pady=10)
+                ctk.CTkLabel(dialog, text="Image not found", text_color="red").pack(pady=10)
             
-            # Confidence slider
-            conf_frame = ttk.Frame(dialog)
-            conf_frame.pack(pady=10)
+            # Confidence entry
+            conf_frame = ctk.CTkFrame(dialog)
+            conf_frame.pack(pady=10, padx=10, fill=tk.X)
             
-            ttk.Label(conf_frame, text="Confidence:").pack(side=tk.LEFT, padx=5)
-            conf_var = tk.DoubleVar(value=cmd.confidence)
-            conf_scale = ttk.Scale(conf_frame, from_=0.1, to=1.0, variable=conf_var, orient=tk.HORIZONTAL, length=200)
-            conf_scale.pack(side=tk.LEFT, padx=5)
-            conf_label = ttk.Label(conf_frame, text=f"{cmd.confidence:.2f}")
-            conf_label.pack(side=tk.LEFT, padx=5)
-            
-            def update_label(event=None):
-                conf_label.config(text=f"{conf_var.get():.2f}")
-            
-            conf_scale.bind("<Motion>", update_label)
-            conf_scale.bind("<ButtonRelease-1>", update_label)
+            ctk.CTkLabel(conf_frame, text="Confidence (0.1-1.0):").pack(side=tk.LEFT, padx=5)
+            conf_var = tk.StringVar(value=f"{cmd.confidence:.2f}")
+            conf_entry = ctk.CTkEntry(conf_frame, textvariable=conf_var, width=100)
+            conf_entry.pack(side=tk.LEFT, padx=5)
             
             # Buttons
-            btn_frame = ttk.Frame(dialog)
+            btn_frame = ctk.CTkFrame(dialog)
             btn_frame.pack(pady=20)
             
             def recapture():
@@ -5024,20 +5196,31 @@ class MacroMakerApp:
                     if cmd.image_path in self.thumbnail_cache:
                         del self.thumbnail_cache[cmd.image_path]
                     messagebox.showinfo("Success", "Image updated!")
+                    dialog.grab_release()
                     dialog.destroy()
                     self.update_command_list()
                     self.save_macros()
             
             def save_changes():
                 self.save_state()
-                cmd.confidence = conf_var.get()
+                try:
+                    conf_value = float(conf_var.get())
+                    conf_value = max(0.1, min(1.0, conf_value))
+                except ValueError:
+                    conf_value = 0.8
+                cmd.confidence = conf_value
                 self.update_command_list()
                 self.save_macros()
+                dialog.grab_release()
                 dialog.destroy()
             
-            ttk.Button(btn_frame, text="Recapture Image", command=recapture).pack(side=tk.LEFT, padx=5)
-            ttk.Button(btn_frame, text="Save", command=save_changes).pack(side=tk.LEFT, padx=5)
-            ttk.Button(btn_frame, text="Cancel", command=dialog.destroy).pack(side=tk.LEFT, padx=5)
+            def cancel_dialog():
+                dialog.grab_release()
+                dialog.destroy()
+            
+            ctk.CTkButton(btn_frame, text="Recapture Image", command=recapture, width=120).pack(side=tk.LEFT, padx=5)
+            ctk.CTkButton(btn_frame, text="Save", command=save_changes, width=80).pack(side=tk.LEFT, padx=5)
+            ctk.CTkButton(btn_frame, text="Cancel", command=cancel_dialog, width=80).pack(side=tk.LEFT, padx=5)
     
     def set_window_position(self):
         """Save current window position and size for the current macro"""
@@ -5058,7 +5241,7 @@ class MacroMakerApp:
 
 
 def main():
-    root = tk.Tk()
+    root = ctk.CTk()
     app = MacroMakerApp(root)
     root.mainloop()
 

@@ -9,3 +9,4 @@ Macro maker
 - The app listens across the system when open for any of the assigned hotkeys for any of the macros in the dropdown menu, if the hotkey for any particular macro is pressed, it changes the dropdown selection to that macro automatically
 - Macros saved in the GUI are preserved between sessions and reboots, are editable when selected, and there is a delete button in the GUI to delete the currently selected macro.
 - Also include repeat statements
+- Install CustomTkinter packages/modules, automatically apply appropriate stylizations and approximate features and ensure the GUI gives a unique color to each type of action
