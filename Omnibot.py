@@ -379,7 +379,7 @@ def find_image_cv2(template_path, confidence, search_region=None):
         return False, 0, 0, None
 
 def find_image_with_verification(image_path, confidence, move_to_image, search_region=None, 
-                                  max_attempts=1, verify_tolerance=0.6):
+                                  max_attempts=1, verify_tolerance=0.6, app_window_bounds=None):
     """
     Find image on screen and optionally move cursor to it.
     
@@ -393,10 +393,18 @@ def find_image_with_verification(image_path, confidence, move_to_image, search_r
         search_region: Optional (x1,y1,x2,y2) or (left,top,w,h) region to search
         max_attempts: Maximum retry attempts (default 1 for immediate response)
         verify_tolerance: Minimum similarity for verification (unused in fast mode)
+        app_window_bounds: Optional (x, y, width, height) of app window to exclude from search
     
     Returns:
         (found: bool, final_center: tuple or None)
     """
+    
+    def is_within_app_window(cx, cy):
+        """Check if a point is within the app window bounds"""
+        if not app_window_bounds:
+            return False
+        x, y, w, h = app_window_bounds
+        return (x <= cx <= x + w) and (y <= cy <= y + h)
     template, tw, th = load_template(image_path)
     if template is None:
         print(f"[Find] Could not load template: {image_path}")
@@ -433,14 +441,24 @@ def find_image_with_verification(image_path, confidence, move_to_image, search_r
         cx, cy = pyautogui.center(location)
         cx, cy = int(cx), int(cy)
     
+    # Check if the found location is within the app window - DO THIS BEFORE MOVING MOUSE
+    if is_within_app_window(cx, cy):
+        print(f"[Find] IGNORED: Match at ({cx},{cy}) is within app window - skipping")
+        if DEBUG_IMAGE:
+            print(f"[Find] App window bounds: {app_window_bounds}")
+        return False, None
+    
     if DEBUG_IMAGE:
         print(f"[Find] Found match at center: ({cx}, {cy})")
     
-    # Move cursor if requested - do it once and immediately return
+    # ONLY move cursor if requested AND after all validation passes
     if move_to_image:
+        print(f"[Find] Moving cursor to ({cx},{cy})")
         pyautogui.moveTo(cx, cy)
+    else:
+        print(f"[Find] Image found but move_to_image=False, not moving cursor")
     
-    print(f"[Find] SUCCESS: Found image at ({cx},{cy})")
+    print(f"[Find] SUCCESS: Found image at ({cx},{cy}), moved={move_to_image}")
     return True, (cx, cy)
 
 
@@ -538,6 +556,10 @@ class MacroCommand:
             return CaptureScreenCommand(data.get("x1"), data.get("y1"), data.get("x2"), data.get("y2"))
         elif cmd_type == "save_clipboard_image":
             return SaveClipboardImageCommand(data.get("filename"))
+        elif cmd_type == "label":
+            return LabelCommand(data.get("label_name", ""))
+        elif cmd_type == "goto":
+            return GotoCommand(data.get("label_name", ""))
         return None
     
     def __str__(self):
@@ -627,13 +649,18 @@ class MouseClickCommand(MacroCommand):
         if self.mode == "in_place":
             # Click at current mouse position
             current_x, current_y = pyautogui.position()
+            print(f"[MouseClick] Clicking {self.button} at current position ({current_x}, {current_y})")
             pyautogui.click(current_x, current_y, button=self.button)
         elif self.mode == "offset":
             # Click at current position + offset
             current_x, current_y = pyautogui.position()
-            pyautogui.click(current_x + self.offset_x, current_y + self.offset_y, button=self.button)
+            target_x = current_x + self.offset_x
+            target_y = current_y + self.offset_y
+            print(f"[MouseClick] Clicking {self.button} at offset position ({target_x}, {target_y})")
+            pyautogui.click(target_x, target_y, button=self.button)
         else:
             # Click at absolute position (default)
+            print(f"[MouseClick] Clicking {self.button} at absolute position ({self.x}, {self.y})")
             pyautogui.click(self.x, self.y, button=self.button)
     
     def to_dict(self):
@@ -664,6 +691,7 @@ class MouseHoldCommand(MacroCommand):
         self.y = y
     
     def execute(self, context):
+        print(f"[MouseHold] Moving to ({self.x}, {self.y}) and holding {self.button}")
         pyautogui.moveTo(self.x, self.y)
         pyautogui.mouseDown(button=self.button)
     
@@ -682,6 +710,7 @@ class MouseReleaseCommand(MacroCommand):
         self.y = y
     
     def execute(self, context):
+        print(f"[MouseRelease] Moving to ({self.x}, {self.y}) and releasing {self.button}")
         pyautogui.moveTo(self.x, self.y)
         pyautogui.mouseUp(button=self.button)
     
@@ -699,6 +728,7 @@ class MouseMoveCommand(MacroCommand):
         self.y = y
     
     def execute(self, context):
+        print(f"[MouseMove] Moving cursor to ({self.x}, {self.y})")
         pyautogui.moveTo(self.x, self.y)
     
     def to_dict(self):
@@ -774,11 +804,18 @@ class IfImageCommand(MacroCommand):
         if context is None:
             context = {}
         
+        print(f"[IfImage] Starting search for {len(self.image_paths)} image(s), move_to_image={self.move_to_image}")
+        
         # Try to find any of the images
         for img_info in self.image_paths:
             try:
                 image_path = img_info["path"]
                 confidence = img_info.get("confidence", self.confidence)
+                
+                print(f"[IfImage] Searching for: {os.path.basename(image_path)} (confidence={confidence})")
+                
+                # Get app window bounds from context if available
+                app_window_bounds = context.get("app_window_bounds", None)
                 
                 # Use the new verified find function
                 found, center = find_image_with_verification(
@@ -787,7 +824,8 @@ class IfImageCommand(MacroCommand):
                     move_to_image=self.move_to_image,
                     search_region=self.search_region,
                     max_attempts=5,
-                    verify_tolerance=0.55  # Slightly lower tolerance for flexibility
+                    verify_tolerance=0.55,  # Slightly lower tolerance for flexibility
+                    app_window_bounds=app_window_bounds
                 )
                 
                 if found:
@@ -798,13 +836,20 @@ class IfImageCommand(MacroCommand):
                         "confidence": confidence,
                         "move_to_image": self.move_to_image
                     }
+                    print(f"[IfImage] ✓ Found image: {os.path.basename(image_path)} at {center}")
+                    print(f"[IfImage]   Confidence: {confidence}, Move: {self.move_to_image}")
+                    if self.move_to_image:
+                        print(f"[IfImage]   Cursor should be at {center} now")
                     return True
+                else:
+                    print(f"[IfImage] ✗ Image not found: {os.path.basename(image_path)}")
                     
             except Exception as e:
-                print(f"[IfImage] Error finding image {img_info.get('path', 'unknown')}: {e}")
+                print(f"[IfImage] ERROR finding image {img_info.get('path', 'unknown')}: {e}")
                 import traceback
                 traceback.print_exc()
         
+        print(f"[IfImage] Search complete - NO images found")
         return False
     
     def to_dict(self):
@@ -842,6 +887,9 @@ class FindImageCommand(MacroCommand):
         Find image and move cursor to it with verification.
         """
         try:
+            # Get app window bounds from context if available
+            app_window_bounds = context.get("app_window_bounds", None)
+            
             # Use the new verified find function
             found, center = find_image_with_verification(
                 image_path=self.image_path,
@@ -849,7 +897,8 @@ class FindImageCommand(MacroCommand):
                 move_to_image=True,  # FindImageCommand always moves
                 search_region=self.search_region,
                 max_attempts=5,
-                verify_tolerance=0.55
+                verify_tolerance=0.55,
+                app_window_bounds=app_window_bounds
             )
             
             if found and context is not None:
@@ -1517,6 +1566,38 @@ class ClipboardEditCommand(MacroCommand):
         return f"CLIPBOARD: Edit ({op_names.get(self.operation, self.operation)})"
 
 
+class LabelCommand(MacroCommand):
+    def __init__(self, label_name=""):
+        super().__init__("label")
+        self.label_name = label_name
+    
+    def execute(self, context):
+        # Labels don't execute anything, they're just markers
+        pass
+    
+    def to_dict(self):
+        return {"type": self.command_type, "label_name": self.label_name}
+    
+    def __str__(self):
+        return f"LABEL: {self.label_name}"
+
+
+class GotoCommand(MacroCommand):
+    def __init__(self, label_name=""):
+        super().__init__("goto")
+        self.label_name = label_name
+    
+    def execute(self, context):
+        # Goto execution is handled by the executor
+        pass
+    
+    def to_dict(self):
+        return {"type": self.command_type, "label_name": self.label_name}
+    
+    def __str__(self):
+        return f"GOTO: {self.label_name}"
+
+
 class SoundCommand(MacroCommand):
     def __init__(self, sound_type="beep"):
         super().__init__("sound")
@@ -1597,28 +1678,80 @@ class MacroExecutor:
     def __init__(self):
         self.running = False
         self.stop_flag = False
+        self.logger = None  # Will be set by MacroApp
+        self.app_window = None  # Will be set by MacroApp
+    
+    def set_logger(self, logger_func):
+        """Set the logging function"""
+        self.logger = logger_func
+    
+    def set_app_window(self, window):
+        """Set the application window reference"""
+        self.app_window = window
+    
+    def get_app_window_bounds(self):
+        """Get the application window bounds as (x, y, width, height)"""
+        if self.app_window:
+            try:
+                x = self.app_window.winfo_x()
+                y = self.app_window.winfo_y()
+                width = self.app_window.winfo_width()
+                height = self.app_window.winfo_height()
+                return (x, y, width, height)
+            except:
+                pass
+        return None
+    
+    def log(self, message, color="white"):
+        """Log a message if logger is available"""
+        if self.logger:
+            self.logger(message, color)
+        else:
+            print(message)
     
     def execute(self, macro, repeat_count=1, progress_callback=None):
         """Execute a macro with repeat support"""
         self.running = True
         self.stop_flag = False
         
+        self.log(f"\n========== Starting Macro: {macro.name} ==========", "cyan")
+        self.log(f"Repeat count: {repeat_count if repeat_count > 0 else 'Infinite'}")
+        
         if repeat_count == 0:
             # Infinite loop
+            iteration = 1
             while not self.stop_flag:
+                self.log(f"\n--- Iteration {iteration} ---", "yellow")
                 self._run_commands(macro.commands, progress_callback, 0)
+                iteration += 1
         else:
-            for _ in range(repeat_count):
+            for i in range(repeat_count):
                 if self.stop_flag:
                     break
+                if repeat_count > 1:
+                    self.log(f"\n--- Iteration {i+1}/{repeat_count} ---", "yellow")
                 self._run_commands(macro.commands, progress_callback, 0)
         
+        self.log(f"\n========== Macro Completed ==========", "cyan")
         self.running = False
     
     def _run_commands(self, commands, progress_callback=None, base_index=0):
         """Run a list of commands with control flow support"""
         context = {}
+        
+        # Store app window bounds in context to exclude from image search
+        app_bounds = self.get_app_window_bounds()
+        if app_bounds:
+            context["app_window_bounds"] = app_bounds
+            self.log(f"App window bounds: x={app_bounds[0]}, y={app_bounds[1]}, w={app_bounds[2]}, h={app_bounds[3]}")
+        
         i = 0
+        
+        # Build a label map for goto commands
+        label_map = {}
+        for idx, cmd in enumerate(commands):
+            if isinstance(cmd, LabelCommand):
+                label_map[cmd.label_name] = idx
         
         while i < len(commands) and not self.stop_flag:
             cmd = commands[i]
@@ -1627,7 +1760,16 @@ class MacroExecutor:
             if progress_callback:
                 progress_callback(base_index + i)
             
-            if isinstance(cmd, IfStatementCommand):
+            if isinstance(cmd, GotoCommand):
+                # Jump to the label
+                if cmd.label_name in label_map:
+                    i = label_map[cmd.label_name]
+                    continue
+                else:
+                    # Label not found, just continue
+                    print(f"Warning: Label '{cmd.label_name}' not found")
+            
+            elif isinstance(cmd, IfStatementCommand):
                 # Simple boolean condition evaluation
                 condition_result = eval(cmd.condition) if cmd.condition else False
                 if not condition_result:
@@ -1636,7 +1778,15 @@ class MacroExecutor:
                     continue
             
             elif isinstance(cmd, IfImageCommand):
-                if not cmd.execute(context):
+                self.log(f"[{i+1}] Executing: {cmd}", "magenta")
+                result = cmd.execute(context)
+                self.log(f"    Result: {'Image FOUND' if result else 'Image NOT FOUND'}" , "green" if result else "red")
+                if "last_image_match" in context:
+                    match_info = context["last_image_match"]
+                    self.log(f"    Image: {os.path.basename(match_info['template_path'])}")
+                    self.log(f"    Center: {match_info['center']}")
+                    self.log(f"    Move to image: {match_info['move_to_image']}")
+                if not result:
                     # Skip to ELSE or ENDIF
                     i = self._skip_to_else_or_endif(commands, i)
                     continue
@@ -1657,8 +1807,15 @@ class MacroExecutor:
                         self._run_commands(repeat_commands, progress_callback, base_index + i + 1)
                     i = end_repeat_idx
             
-            elif not isinstance(cmd, (EndIfStatementCommand, EndRepeatCommand)):
-                cmd.execute(context)
+            elif not isinstance(cmd, (EndIfStatementCommand, EndRepeatCommand, LabelCommand)):
+                self.log(f"[{i+1}] Executing: {cmd}")
+                try:
+                    cmd.execute(context)
+                    self.log(f"    Status: SUCCESS", "green")
+                except Exception as e:
+                    self.log(f"    Status: FAILED - {str(e)}", "red")
+                    import traceback
+                    self.log(f"    Traceback: {traceback.format_exc()}", "red")
             
             # Add 0.25s delay between every action
             if not self.stop_flag:
@@ -1731,6 +1888,7 @@ class MacroMakerApp:
         self.click_timer = None  # Timer for double-click detection
         self.copied_command = None  # Store copied command
         self.delete_key_pressed = False  # Track delete key state to prevent auto-repeat
+        self.log_text = None  # Will be set during UI setup
         
         # Undo/Redo stacks
         self.undo_stack = []
@@ -1761,6 +1919,10 @@ class MacroMakerApp:
             'RepeatCommand': '#E74C3C',
             'EndRepeatCommand': '#C0392B',
             
+            # Label/Goto - Blue tones (automation control flow)
+            'LabelCommand': '#3498DB',
+            'GotoCommand': '#2980B9',
+            
             # Timing actions - Yellow tones
             'DelayCommand': '#F39C12',
             'DelayMsCommand': '#F1C40F',
@@ -1785,11 +1947,18 @@ class MacroMakerApp:
         self.default_border_color = "#565b5e"  # Default CustomTkinter border
         
         self.setup_ui()
-        # Set minimum size and center on screen
-        self.root.minsize(1000, 600)
-        schedule_autosize(self.root, min_size=(1000, 600))
+        # Allow window to be resizable and auto-size to content
+        self.root.resizable(True, True)
+        # Set a reasonable minimum size
+        self.root.minsize(600, 400)
+        # Let the window size based on content initially
+        self.root.update_idletasks()
         self.load_macros()
         self.start_hotkey_listener()
+        
+        # Pass logger and app window to executor
+        self.executor.set_logger(self.log_message)
+        self.executor.set_app_window(self.root)
     
     def make_tabbable(self, widget):
         """Make a widget properly tabbable with focus highlighting and keyboard activation"""
@@ -1919,7 +2088,7 @@ class MacroMakerApp:
         original_border = None
         original_fg_color = None
         
-        def lighten_color(hex_color, factor=0.3):
+        def lighten_color(hex_color, factor=0.5):
             """Lighten a hex color by a factor (0-1)"""
             try:
                 # Remove # if present
@@ -1957,23 +2126,22 @@ class MacroMakerApp:
             nonlocal original_border, original_fg_color
             print(f"[FOCUS_IN] {get_widget_info(widget)}")
             try:
-                # For CTkButton, change the fg_color to a lighter shade
+                # For CTkButton, change the fg_color to orange when focused
                 if isinstance(widget, ctk.CTkButton):
                     try:
                         original_fg_color = widget.cget('fg_color')
                         print(f"[COLOR_DEBUG] Original color: {original_fg_color}, type: {type(original_fg_color)}")
+                        # Set to bright orange when focused
+                        focus_orange = "#FF8C00"  # Dark orange
                         if isinstance(original_fg_color, tuple):
-                            # Handle tuple (light mode, dark mode)
-                            light_color = lighten_color(original_fg_color[0])
-                            dark_color = lighten_color(original_fg_color[1])
-                            new_color = (light_color, dark_color)
-                            print(f"[COLOR_DEBUG] Lightened tuple: {new_color}")
+                            # Handle tuple (light mode, dark mode) - use orange for both
+                            new_color = (focus_orange, focus_orange)
+                            print(f"[COLOR_DEBUG] Setting to orange tuple: {new_color}")
                             widget.configure(fg_color=new_color)
                         else:
-                            # Single color
-                            lighter = lighten_color(original_fg_color)
-                            print(f"[COLOR_DEBUG] Lightened single: {lighter}")
-                            widget.configure(fg_color=lighter)
+                            # Single color - set to orange
+                            print(f"[COLOR_DEBUG] Setting to orange: {focus_orange}")
+                            widget.configure(fg_color=focus_orange)
                     except Exception as e:
                         print(f"[COLOR_DEBUG] Error changing button color: {e}")
                 else:
@@ -2087,44 +2255,152 @@ class MacroMakerApp:
         dialog.wait_window()
         return result["value"]
     
+    def show_label_selection_dialog(self, title, prompt, labels):
+        """Show a dialog with a dropdown to select from available labels"""
+        dialog = ctk.CTkToplevel(self.root)
+        dialog.title(title)
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        result = {"value": None}
+        
+        # Create content
+        ctk.CTkLabel(dialog, text=prompt, font=("Arial", 12)).pack(pady=(20, 10), padx=20)
+        
+        label_var = tk.StringVar(value=labels[0] if labels else "")
+        dropdown = ctk.CTkComboBox(dialog, variable=label_var, values=labels, width=300)
+        dropdown.pack(pady=10, padx=20)
+        self.add_focus_highlighting(dropdown)
+        dropdown.focus_set()
+        
+        def submit(event=None):
+            result["value"] = label_var.get()
+            dialog.grab_release()
+            dialog.destroy()
+            return "break"
+        
+        def cancel(event=None):
+            dialog.grab_release()
+            dialog.destroy()
+            return "break"
+        
+        # Button frame
+        btn_frame = ctk.CTkFrame(dialog)
+        btn_frame.pack(pady=15, padx=20)
+        
+        ok_btn = ctk.CTkButton(btn_frame, text="OK", command=submit, width=100)
+        ok_btn.pack(side=tk.LEFT, padx=5)
+        
+        cancel_btn = ctk.CTkButton(btn_frame, text="Cancel", command=cancel, width=100)
+        cancel_btn.pack(side=tk.LEFT, padx=5)
+        
+        # Set up tab navigation
+        self.setup_dialog_tab_order(dialog, [dropdown, ok_btn, cancel_btn])
+        
+        # Bind keys
+        dialog.bind("<Return>", submit)
+        dialog.bind("<Escape>", cancel)
+        
+        # Auto-size and center dialog
+        schedule_autosize(dialog)
+        
+        dialog.wait_window()
+        return result["value"]
+    
     def setup_ui(self):
-        # Top frame for macro selection
+        # Top frame for macro selection - wrap buttons responsively
         top_frame = ctk.CTkFrame(self.root)
         top_frame.pack(fill=tk.X, padx=10, pady=10)
         
-        ctk.CTkLabel(top_frame, text="Macro:").pack(side=tk.LEFT, padx=5)
+        # First row: Macro dropdown and repeat
+        control_row = ctk.CTkFrame(top_frame)
+        control_row.pack(fill=tk.X, pady=(0, 5))
+        
+        ctk.CTkLabel(control_row, text="Macro:").pack(side=tk.LEFT, padx=5)
         
         self.macro_var = tk.StringVar()
-        self.macro_dropdown = ctk.CTkComboBox(top_frame, variable=self.macro_var, width=250, command=self._on_macro_dropdown_changed)
+        self.macro_dropdown = ctk.CTkComboBox(control_row, variable=self.macro_var, width=250, command=self._on_macro_dropdown_changed)
         self.macro_dropdown.pack(side=tk.LEFT, padx=5)
         self.add_focus_highlighting(self.macro_dropdown)
         
-        ctk.CTkLabel(top_frame, text="Repeat:").pack(side=tk.LEFT, padx=5)
+        # Bind custom keyboard shortcuts for macro dropdown
+        self.macro_dropdown.bind("<BackSpace>", self.on_macro_dropdown_backspace)
+        self.macro_dropdown.bind("<Up>", self.on_macro_dropdown_up)
+        self.macro_dropdown.bind("<Down>", self.on_macro_dropdown_down)
+        self.macro_dropdown.bind("<Alt-Down>", self.on_macro_dropdown_alt_down)
+        
+        ctk.CTkLabel(control_row, text="Repeat:").pack(side=tk.LEFT, padx=5)
         self.repeat_var = tk.StringVar(value="1")
         self.repeat_var.trace_add("write", self._on_repeat_changed)
-        self.repeat_entry = ctk.CTkEntry(top_frame, textvariable=self.repeat_var, width=80)
+        self.repeat_entry = ctk.CTkEntry(control_row, textvariable=self.repeat_var, width=80)
         self.repeat_entry.pack(side=tk.LEFT, padx=5)
         self.add_focus_highlighting(self.repeat_entry)
         
-        btn_new = ctk.CTkButton(top_frame, text="New Macro", command=self.new_macro, width=100)
-        btn_new.pack(side=tk.LEFT, padx=5)
-        self.add_focus_highlighting(btn_new)
+        # Second row: Action buttons - scrollable container
+        button_container = ctk.CTkFrame(top_frame)
+        button_container.pack(fill=tk.X)
         
-        btn_delete = ctk.CTkButton(top_frame, text="Delete Macro", command=self.delete_macro, width=100)
-        btn_delete.pack(side=tk.LEFT, padx=5)
-        self.add_focus_highlighting(btn_delete)
+        # Create scrollable frame for buttons
+        button_canvas = tk.Canvas(button_container, bg="#2b2b2b", highlightthickness=0, height=40)
+        button_scrollbar = ctk.CTkScrollbar(button_container, orientation="horizontal", command=button_canvas.xview)
+        button_canvas.configure(xscrollcommand=button_scrollbar.set)
         
-        btn_hotkey = ctk.CTkButton(top_frame, text="Set Hotkey", command=self.set_hotkey, width=100)
-        btn_hotkey.pack(side=tk.LEFT, padx=5)
-        self.add_focus_highlighting(btn_hotkey)
+        # Frame inside canvas to hold buttons
+        button_row = tk.Frame(button_canvas, bg="#2b2b2b")
+        button_canvas_frame = button_canvas.create_window((0, 0), window=button_row, anchor="nw")
         
-        btn_remove_hotkey = ctk.CTkButton(top_frame, text="Remove Hotkey", command=self.remove_hotkey, width=120)
-        btn_remove_hotkey.pack(side=tk.LEFT, padx=5)
-        self.add_focus_highlighting(btn_remove_hotkey)
+        # Pack scrollbar and canvas
+        button_canvas.pack(side=tk.TOP, fill=tk.X, expand=True)
+        button_scrollbar.pack(side=tk.BOTTOM, fill=tk.X)
         
-        btn_position = ctk.CTkButton(top_frame, text="Set Position", command=self.set_window_position, width=100)
-        btn_position.pack(side=tk.LEFT, padx=5)
-        self.add_focus_highlighting(btn_position)
+        # Create buttons with minimum widths to prevent disappearing
+        self.btn_new = ctk.CTkButton(button_row, text="New Macro (Ctrl+N)", command=self.new_macro, width=150)
+        self.btn_new.pack(side=tk.LEFT, padx=2, pady=2)
+        self.add_focus_highlighting(self.btn_new)
+        
+        self.btn_delete = ctk.CTkButton(button_row, text="Delete Macro (Ctrl+Del)", command=self.delete_macro, width=180)
+        self.btn_delete.pack(side=tk.LEFT, padx=2, pady=2)
+        self.add_focus_highlighting(self.btn_delete)
+        
+        self.btn_hotkey = ctk.CTkButton(button_row, text="Set Hotkey (Ctrl+Alt+S)", command=self.set_hotkey, width=180)
+        self.btn_hotkey.pack(side=tk.LEFT, padx=2, pady=2)
+        self.add_focus_highlighting(self.btn_hotkey)
+        
+        self.btn_remove_hotkey = ctk.CTkButton(button_row, text="Remove Hotkey (Ctrl+Alt+R)", command=self.remove_hotkey, width=210)
+        self.btn_remove_hotkey.pack(side=tk.LEFT, padx=2, pady=2)
+        self.add_focus_highlighting(self.btn_remove_hotkey)
+        
+        self.btn_position = ctk.CTkButton(button_row, text="Set Position (Ctrl+Alt+P)", command=self.set_window_position, width=200)
+        self.btn_position.pack(side=tk.LEFT, padx=2, pady=2)
+        self.add_focus_highlighting(self.btn_position)
+        
+        # Update canvas scroll region when button frame changes size
+        def update_button_scroll(event=None):
+            button_canvas.configure(scrollregion=button_canvas.bbox("all"))
+            # Adjust canvas height to match button row height
+            button_row.update_idletasks()
+            req_height = button_row.winfo_reqheight()
+            button_canvas.configure(height=req_height)
+        
+        button_row.bind("<Configure>", update_button_scroll)
+        update_button_scroll()
+        
+        # Enable mousewheel scrolling on button canvas
+        def on_button_mousewheel(event):
+            button_canvas.xview_scroll(int(-1*(event.delta/120)), "units")
+        
+        button_canvas.bind("<MouseWheel>", on_button_mousewheel)
+        button_row.bind("<MouseWheel>", on_button_mousewheel)
+        
+        # Set up tab order: dropdown -> repeat -> buttons
+        # This allows tabbing through all controls in order
+        self.macro_dropdown.lift()
+        self.repeat_entry.lift()
+        self.btn_new.lift()
+        self.btn_delete.lift()
+        self.btn_hotkey.lift()
+        self.btn_remove_hotkey.lift()
+        self.btn_position.lift()
         
         # Middle frame for command list
         middle_frame = ctk.CTkFrame(self.root)
@@ -2170,6 +2446,38 @@ class MacroMakerApp:
         # Bind F2 to focus command list
         self.root.bind("<F2>", lambda e: self.command_canvas.focus_set())
         
+        # Bind Shift+F2 to focus macro dropdown
+        self.root.bind("<Shift-F2>", lambda e: self.focus_macro_dropdown())
+        
+        # Bind Shift+F10 globally to open context menu
+        self.root.bind("<Shift-F10>", self.show_context_menu_keyboard)
+        
+        # Bind keyboard shortcuts for macro management buttons
+        self.root.bind("<Control-n>", lambda e: self.new_macro())
+        self.root.bind("<Control-Delete>", lambda e: self.delete_macro())
+        self.root.bind("<Control-Alt-s>", lambda e: self.set_hotkey())
+        self.root.bind("<Control-Alt-r>", lambda e: self.remove_hotkey())
+        self.root.bind("<Control-Alt-p>", lambda e: self.set_window_position())
+        
+        # Debug log window
+        log_frame = ctk.CTkFrame(middle_frame)
+        log_frame.pack(fill=tk.X, pady=(10, 0))
+        
+        log_header = ctk.CTkFrame(log_frame)
+        log_header.pack(fill=tk.X)
+        ctk.CTkLabel(log_header, text="Execution Log:", font=("Arial", 12, "bold")).pack(side=tk.LEFT, padx=10, pady=5)
+        ctk.CTkButton(log_header, text="Clear Log", command=self.clear_log, width=100).pack(side=tk.RIGHT, padx=10, pady=5)
+        
+        log_text_frame = ctk.CTkFrame(log_frame)
+        log_text_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        self.log_text = tk.Text(log_text_frame, height=8, bg="#1a1a1a", fg="#00ff00", font=("Consolas", 9), wrap=tk.WORD)
+        self.log_text.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        
+        log_scrollbar = ctk.CTkScrollbar(log_text_frame, command=self.log_text.yview)
+        log_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.log_text.configure(yscrollcommand=log_scrollbar.set)
+        
         # Bind arrow keys for navigation when canvas is focused
         self.command_canvas.bind("<Up>", self.navigate_up)
         self.command_canvas.bind("<Down>", self.navigate_down)
@@ -2197,104 +2505,50 @@ class MacroMakerApp:
         self.root.bind("<KeyPress-Delete>", self.on_delete_press)
         self.root.bind("<KeyRelease-Delete>", self.on_delete_release)
         
-        # Command buttons
-        btn_frame = ctk.CTkFrame(middle_frame)
-        btn_frame.pack(fill=tk.X, padx=10, pady=2)
-        
-        btn_keyboard = ctk.CTkButton(btn_frame, text="Add Keyboard Action", command=self.add_keyboard_sequence, width=150, fg_color="#4A90E2")
-        btn_keyboard.pack(side=tk.LEFT, padx=2)
-        self.add_focus_highlighting(btn_keyboard)
-        
-        btn_mouse = ctk.CTkButton(btn_frame, text="Add Mouse Click", command=self.add_mouse_click, width=130, fg_color="#50C878")
-        btn_mouse.pack(side=tk.LEFT, padx=2)
-        self.add_focus_highlighting(btn_mouse)
-        
-        btn_mouse_abs = ctk.CTkButton(btn_frame, text="Add Mouse Click (Absolute)", command=self.add_mouse_click_absolute, width=180, fg_color="#50C878")
-        btn_mouse_abs.pack(side=tk.LEFT, padx=2)
-        self.add_focus_highlighting(btn_mouse_abs)
-        
-        btn_mouse_move = ctk.CTkButton(btn_frame, text="Add Mouse Move", command=self.add_mouse_move, width=130, fg_color="#2F8B57")
-        btn_mouse_move.pack(side=tk.LEFT, padx=2)
-        self.add_focus_highlighting(btn_mouse_move)
-        
-        btn_frame2 = ctk.CTkFrame(middle_frame)
-        btn_frame2.pack(fill=tk.X, padx=10, pady=2)
-        
-        btn_if = ctk.CTkButton(btn_frame2, text="Add IF", command=self.add_if, width=80, fg_color="#E67E22")
-        btn_if.pack(side=tk.LEFT, padx=2)
-        self.add_focus_highlighting(btn_if)
-        
-        btn_else = ctk.CTkButton(btn_frame2, text="Add ELSE", command=self.add_else, width=80, fg_color="#D35400")
-        btn_else.pack(side=tk.LEFT, padx=2)
-        self.add_focus_highlighting(btn_else)
-        
-        btn_endif = ctk.CTkButton(btn_frame2, text="Add ENDIF", command=self.add_endif, width=80, fg_color="#FF8C42")
-        btn_endif.pack(side=tk.LEFT, padx=2)
-        self.add_focus_highlighting(btn_endif)
-        btn_if_image = ctk.CTkButton(btn_frame2, text="Add IF IMAGE", command=self.add_if_image, width=110, fg_color="#9B59B6")
-        btn_if_image.pack(side=tk.LEFT, padx=2)
-        self.add_focus_highlighting(btn_if_image)
-        
-        btn_find_image = ctk.CTkButton(btn_frame2, text="Add FIND IMAGE", command=self.add_find_image, width=130, fg_color="#8E44AD")
-        btn_find_image.pack(side=tk.LEFT, padx=2)
-        self.add_focus_highlighting(btn_find_image)
-        
-        btn_frame3 = ctk.CTkFrame(middle_frame)
-        btn_frame3.pack(fill=tk.X, padx=10, pady=2)
-        
-        btn_repeat = ctk.CTkButton(btn_frame3, text="Add REPEAT", command=self.add_repeat, width=110, fg_color="#E74C3C")
-        btn_repeat.pack(side=tk.LEFT, padx=2)
-        self.add_focus_highlighting(btn_repeat)
-        
-        btn_end_repeat = ctk.CTkButton(btn_frame3, text="Add END REPEAT", command=self.add_end_repeat, width=130, fg_color="#C0392B")
-        btn_end_repeat.pack(side=tk.LEFT, padx=2)
-        self.add_focus_highlighting(btn_end_repeat)
-        
-        btn_delay = ctk.CTkButton(btn_frame3, text="Add Delay", command=self.add_delay, width=90, fg_color="#F39C12")
-        btn_delay.pack(side=tk.LEFT, padx=2)
-        self.add_focus_highlighting(btn_delay)
-        
-        btn_delay_ms = ctk.CTkButton(btn_frame3, text="Add Delay (ms)", command=self.add_delay_ms, width=110, fg_color="#F1C40F")
-        btn_delay_ms.pack(side=tk.LEFT, padx=2)
-        self.add_focus_highlighting(btn_delay_ms)
-        
-        btn_message = ctk.CTkButton(btn_frame3, text="Add Message", command=self.add_message, width=110, fg_color="#1ABC9C")
-        btn_message.pack(side=tk.LEFT, padx=2)
-        self.add_focus_highlighting(btn_message)
-        
-        btn_sound = ctk.CTkButton(btn_frame3, text="Add Sound", command=self.add_sound, width=100, fg_color="#16A085")
-        btn_sound.pack(side=tk.LEFT, padx=2)
-        self.add_focus_highlighting(btn_sound)
-        
-        btn_frame4 = ctk.CTkFrame(middle_frame)
-        btn_frame4.pack(fill=tk.X, padx=10, pady=2)
-        
-        btn_wait = ctk.CTkButton(btn_frame4, text="Wait For Window", command=self.add_wait_for_window, width=120, fg_color="#D4AC0D")
-        btn_wait.pack(side=tk.LEFT, padx=2)
-        self.add_focus_highlighting(btn_wait)
-        
-        btn_focus = ctk.CTkButton(btn_frame4, text="Focus Window", command=self.add_focus_window, width=110, fg_color="#F39C12")
-        btn_focus.pack(side=tk.LEFT, padx=2)
-        self.add_focus_highlighting(btn_focus)
-        
-        btn_remove = ctk.CTkButton(btn_frame4, text="Remove Selected", command=self.remove_command, width=130, fg_color="#E74C3C")
-        btn_remove.pack(side=tk.LEFT, padx=2)
-        self.add_focus_highlighting(btn_remove)
-        
         # Bottom frame for execution
         bottom_frame = ctk.CTkFrame(self.root)
         bottom_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
         
-        btn_run = ctk.CTkButton(bottom_frame, text="▶ Run Macro", command=self.run_macro, width=140, height=40, fg_color="#27AE60", font=("Arial", 14, "bold"))
-        btn_run.pack(side=tk.LEFT, padx=5, pady=5)
+        btn_run = ctk.CTkButton(bottom_frame, text="▶ Run Macro", command=self.run_macro, height=40, fg_color="#27AE60", font=("Arial", 14, "bold"))
+        btn_run.pack(side=tk.LEFT, padx=5, pady=5, expand=True, fill=tk.X)
         self.add_focus_highlighting(btn_run)
         
-        btn_stop = ctk.CTkButton(bottom_frame, text="⏹ Stop Macro", command=self.stop_macro, width=140, height=40, fg_color="#C0392B", font=("Arial", 14, "bold"))
-        btn_stop.pack(side=tk.LEFT, padx=5, pady=5)
+        btn_stop = ctk.CTkButton(bottom_frame, text="⏹ Stop Macro", command=self.stop_macro, height=40, fg_color="#C0392B", font=("Arial", 14, "bold"))
+        btn_stop.pack(side=tk.LEFT, padx=5, pady=5, expand=True, fill=tk.X)
         self.add_focus_highlighting(btn_stop)
         
         self.status_label = ctk.CTkLabel(bottom_frame, text="Ready", font=("Arial", 12))
         self.status_label.pack(side=tk.LEFT, padx=20)
+    
+    def log_message(self, message, color="white"):
+        """Log a message to the log window"""
+        if not self.log_text:
+            print(message)  # Fallback to console
+            return
+        
+        # Color mapping
+        color_map = {
+            "white": "#ffffff",
+            "green": "#00ff00",
+            "red": "#ff0000",
+            "yellow": "#ffff00",
+            "cyan": "#00ffff",
+            "magenta": "#ff00ff",
+            "orange": "#ffa500"
+        }
+        
+        hex_color = color_map.get(color, color)
+        
+        # Insert message with color tag
+        self.log_text.insert(tk.END, message + "\n", color)
+        self.log_text.tag_config(color, foreground=hex_color)
+        self.log_text.see(tk.END)  # Auto-scroll to bottom
+        self.log_text.update_idletasks()
+    
+    def clear_log(self):
+        """Clear the log window"""
+        if self.log_text:
+            self.log_text.delete(1.0, tk.END)
     
     def update_command_list(self):
         """Update the command list with thumbnails for image commands and color-coded action types"""
@@ -2570,6 +2824,10 @@ class MacroMakerApp:
             return CaptureScreenCommand(data['x1'], data['y1'], data['x2'], data['y2'])
         elif cmd_type == 'save_clipboard_image':
             return SaveClipboardImageCommand(data.get('filename'))
+        elif cmd_type == 'label':
+            return LabelCommand(data.get('label_name', ''))
+        elif cmd_type == 'goto':
+            return GotoCommand(data.get('label_name', ''))
         
         return None
     
@@ -2696,6 +2954,34 @@ class MacroMakerApp:
             if new_count is not None:
                 self.save_state()
                 cmd.count = new_count
+                self.update_command_list()
+                self.save_macros()
+        
+        elif isinstance(cmd, LabelCommand):
+            new_name = self.show_input_dialog("Edit Label", "Enter label name:", cmd.label_name, "str")
+            if new_name is not None and new_name.strip():
+                self.save_state()
+                cmd.label_name = new_name.strip()
+                self.update_command_list()
+                self.save_macros()
+        
+        elif isinstance(cmd, GotoCommand):
+            # Get list of available labels in the current macro
+            labels = []
+            for c in self.current_macro.commands:
+                if isinstance(c, LabelCommand):
+                    labels.append(c.label_name)
+            
+            if labels:
+                # Show a dialog with dropdown of available labels
+                new_label = self.show_label_selection_dialog("Edit Goto", "Choose a label to jump to:", labels)
+            else:
+                # If no labels exist, allow manual entry
+                new_label = self.show_input_dialog("Edit Goto", "Enter label name (create labels first for dropdown):", cmd.label_name, "str")
+            
+            if new_label is not None and new_label.strip():
+                self.save_state()
+                cmd.label_name = new_label.strip()
                 self.update_command_list()
                 self.save_macros()
         
@@ -2872,10 +3158,96 @@ class MacroMakerApp:
             self.on_edit_command_direct(self.selected_index)
         return "break"
     
+    def focus_macro_dropdown(self):
+        """Focus the macro dropdown and select its text"""
+        self.macro_dropdown.focus_set()
+        # Try to select the text in the entry
+        try:
+            # Get the internal entry widget of CTkComboBox
+            entry = self.macro_dropdown._entry
+            if entry:
+                entry.select_range(0, tk.END)
+                entry.icursor(tk.END)
+        except:
+            pass
+        return "break"
+    
+    def on_macro_dropdown_backspace(self, event):
+        """Handle backspace in macro dropdown - clear and focus for typing"""
+        self.macro_var.set("")
+        # Focus the entry part for typing
+        try:
+            entry = self.macro_dropdown._entry
+            if entry:
+                entry.focus_set()
+                entry.icursor(0)
+        except:
+            pass
+        return "break"
+    
+    def on_macro_dropdown_up(self, event):
+        """Navigate to previous macro in dropdown"""
+        if not self.macros:
+            return "break"
+        
+        macro_names = list(self.macros.keys())
+        current = self.macro_var.get()
+        
+        if current in macro_names:
+            current_idx = macro_names.index(current)
+            if current_idx > 0:
+                new_macro = macro_names[current_idx - 1]
+                self.macro_var.set(new_macro)
+                self.on_macro_selected()
+        elif macro_names:
+            # Not in list, select last one
+            self.macro_var.set(macro_names[-1])
+            self.on_macro_selected()
+        
+        return "break"
+    
+    def on_macro_dropdown_down(self, event):
+        """Navigate to next macro in dropdown"""
+        if not self.macros:
+            return "break"
+        
+        macro_names = list(self.macros.keys())
+        current = self.macro_var.get()
+        
+        if current in macro_names:
+            current_idx = macro_names.index(current)
+            if current_idx < len(macro_names) - 1:
+                new_macro = macro_names[current_idx + 1]
+                self.macro_var.set(new_macro)
+                self.on_macro_selected()
+        elif macro_names:
+            # Not in list, select first one
+            self.macro_var.set(macro_names[0])
+            self.on_macro_selected()
+        
+        return "break"
+    
+    def on_macro_dropdown_alt_down(self, event):
+        """Expand the dropdown menu when Alt+Down is pressed"""
+        try:
+            # Trigger the dropdown to open
+            self.macro_dropdown._open_dropdown_menu()
+        except:
+            # If the method name is different, try alternate approaches
+            try:
+                # Some CTk versions use different method names
+                if hasattr(self.macro_dropdown, '_dropdown_menu'):
+                    self.macro_dropdown._dropdown_menu.open()
+                elif hasattr(self.macro_dropdown, 'open'):
+                    self.macro_dropdown.open()
+            except:
+                pass
+        return "break"
+    
     def show_context_menu_keyboard(self, event):
         """Show context menu via keyboard (Shift+F10)"""
         if not self.current_macro:
-            return
+            return "break"
         
         # Create a mock event with the position
         class MockEvent:
@@ -2932,8 +3304,10 @@ class MacroMakerApp:
         # Mouse commands submenu
         mouse_menu = tk.Menu(menu, tearoff=0, bg=menu_bg, fg=menu_fg, activebackground="#50C878", activeforeground=menu_fg)
         mouse_menu.add_command(label="Click", underline=0, command=lambda: self.insert_command_at_selection("mouse_click"))
-        mouse_menu.add_command(label="Click (Absolute)", underline=7, command=lambda: self.insert_command_at_selection("mouse_click_absolute"))
+        mouse_menu.add_command(label="click (Absolute)", underline=7, command=lambda: self.insert_command_at_selection("mouse_click_absolute"))
         mouse_menu.add_command(label="Move", underline=0, command=lambda: self.insert_command_at_selection("mouse_move"))
+        mouse_menu.add_command(label="Hold", underline=0, command=lambda: self.insert_command_at_selection("mouse_hold"))
+        mouse_menu.add_command(label="Release", underline=0, command=lambda: self.insert_command_at_selection("mouse_release"))
         menu.add_cascade(label="Mouse Commands", underline=0, menu=mouse_menu)
         
         # Keyboard commands submenu
@@ -2947,16 +3321,18 @@ class MacroMakerApp:
         # Image commands submenu
         image_menu = tk.Menu(menu, tearoff=0, bg=menu_bg, fg=menu_fg, activebackground="#9B59B6", activeforeground=menu_fg)
         image_menu.add_command(label="IF IMAGE", underline=0, command=lambda: self.insert_command_at_selection("if_image"))
-        image_menu.add_command(label="FIND IMAGE", underline=0, command=lambda: self.insert_command_at_selection("find_image"))
+        image_menu.add_command(label="FIND IMAGE", underline=1, command=lambda: self.insert_command_at_selection("find_image"))
         menu.add_cascade(label="Image Commands", underline=1, menu=image_menu)
         
         # Control flow commands submenu
         flow_menu = tk.Menu(menu, tearoff=0, bg=menu_bg, fg=menu_fg, activebackground="#E67E22", activeforeground=menu_fg)
         flow_menu.add_command(label="IF Statement", underline=0, command=lambda: self.insert_command_at_selection("if_statement"))
         flow_menu.add_command(label="ELSE", underline=0, command=lambda: self.insert_command_at_selection("else"))
-        flow_menu.add_command(label="END IF", underline=1, command=lambda: self.insert_command_at_selection("end_if"))
+        flow_menu.add_command(label="eNd IF", underline=1, command=lambda: self.insert_command_at_selection("end_if"))
         flow_menu.add_command(label="REPEAT", underline=0, command=lambda: self.insert_command_at_selection("repeat"))
-        flow_menu.add_command(label="END REPEAT", underline=5, command=lambda: self.insert_command_at_selection("end_repeat"))
+        flow_menu.add_command(label="end Repeat", underline=5, command=lambda: self.insert_command_at_selection("end_repeat"))
+        flow_menu.add_command(label="LABEL", underline=0, command=lambda: self.insert_command_at_selection("label"))
+        flow_menu.add_command(label="GOTO", underline=0, command=lambda: self.insert_command_at_selection("goto"))
         menu.add_cascade(label="Control Flow", underline=8, menu=flow_menu)
         
         # Clipboard commands submenu
@@ -2971,11 +3347,12 @@ class MacroMakerApp:
         clipboard_menu.add_command(label="saVe Image", underline=2, command=lambda: self.insert_command_at_selection("save_clipboard_image"))
         menu.add_cascade(label="cLipboard Commands", underline=1, menu=clipboard_menu)
         
-        # Timing/Utility commands submenu
+        # Timing/Utility/Window commands submenu
         timing_menu = tk.Menu(menu, tearoff=0, bg=menu_bg, fg=menu_fg, activebackground="#F39C12", activeforeground=menu_fg)
         timing_menu.add_command(label="Delay (seconds)", underline=0, command=lambda: self.insert_command_at_selection("delay"))
-        timing_menu.add_command(label="delay (Milliseconds)", underline=1, command=lambda: self.insert_command_at_selection("delay_ms"))
+        timing_menu.add_command(label="delay (Milliseconds)", underline=7, command=lambda: self.insert_command_at_selection("delay_ms"))
         timing_menu.add_command(label="Wait for Window", underline=0, command=lambda: self.insert_command_at_selection("wait_for_window"))
+        timing_menu.add_command(label="Focus window", underline=1, command=lambda: self.insert_command_at_selection("focus_window"))
         timing_menu.add_command(label="Message", underline=0, command=lambda: self.insert_command_at_selection("message"))
         timing_menu.add_command(label="Sound", underline=0, command=lambda: self.insert_command_at_selection("sound"))
         menu.add_cascade(label="Timing/Utility", underline=0, menu=timing_menu)
@@ -3013,6 +3390,8 @@ class MacroMakerApp:
             "end_if": self.add_endif,
             "repeat": self.add_repeat,
             "end_repeat": self.add_end_repeat,
+            "label": self.add_label,
+            "goto": self.add_goto,
             "delay": self.add_delay,
             "delay_ms": self.add_delay_ms,
             "sound": self.add_sound,
@@ -3023,6 +3402,10 @@ class MacroMakerApp:
             self.add_if_image_at_index(insert_index)
         elif command_type == "find_image":
             self.add_find_image_at_index(insert_index)
+        elif command_type == "mouse_hold":
+            self.add_mouse_hold(insert_index)
+        elif command_type == "mouse_release":
+            self.add_mouse_release(insert_index)
         elif command_type == "clipboard_clear":
             self.add_clipboard_clear(insert_index)
         elif command_type == "clipboard_set":
@@ -3252,14 +3635,47 @@ class MacroMakerApp:
         self.macro_dropdown.configure(values=list(self.macros.keys()))
     
     def ensure_dialog_focused(self, dialog):
-        """Ensure dialog is focused and remains focused"""
+        """Ensure dialog is focused and remains focused, auto-focus first text field"""
         dialog.focus_force()
         dialog.lift()
         dialog.attributes('-topmost', True)
-        # Reapply focus after short delays to ensure it sticks (before 100ms)
-        dialog.after(20, lambda: dialog.focus_force())
+        
+        # Find and focus first text entry widget
+        def find_and_focus_first_entry():
+            try:
+                # Recursively search for first entry widget
+                def find_first_entry(widget):
+                    # Check if this widget is an entry/text field
+                    if isinstance(widget, (ctk.CTkEntry, tk.Entry)):
+                        return widget
+                    # Check children
+                    if hasattr(widget, 'winfo_children'):
+                        for child in widget.winfo_children():
+                            result = find_first_entry(child)
+                            if result:
+                                return result
+                    return None
+                
+                first_entry = find_first_entry(dialog)
+                if first_entry:
+                    first_entry.focus_set()
+                    # Select all text if there's any
+                    try:
+                        first_entry.select_range(0, tk.END)
+                    except:
+                        pass
+                    return
+                
+                # If no entry found, just focus the dialog
+                dialog.focus_force()
+            except Exception as e:
+                print(f"[FOCUS] Error finding first entry: {e}")
+                dialog.focus_force()
+        
+        # Apply focus after dialog is fully created
+        dialog.after(10, find_and_focus_first_entry)
         dialog.after(40, lambda: [dialog.focus_force(), dialog.lift()])
-        dialog.after(60, lambda: dialog.focus_force())
+        dialog.after(60, find_and_focus_first_entry)
     
     def set_hotkey(self):
         """Set hotkey for current macro"""
@@ -3304,7 +3720,7 @@ class MacroMakerApp:
             """Restore all temporarily disabled hotkeys"""
             keyboard.unhook_all()
             # Re-register all macros' hotkeys
-            for macro in self.macros:
+            for macro in self.macros.values():
                 if macro.hotkey:
                     self.register_hotkey(macro)
         
@@ -3314,7 +3730,7 @@ class MacroMakerApp:
                 hotkey = "+".join(captured_keys)
                 
                 # Check if this hotkey is already assigned to another macro
-                for macro in self.macros:
+                for macro in self.macros.values():
                     if macro != self.current_macro and macro.hotkey == hotkey:
                         # Remove from the other macro
                         macro.hotkey = None
@@ -4329,6 +4745,52 @@ class MacroMakerApp:
         else:
             messagebox.showwarning("Cancelled", "Mouse position capture was cancelled.")
     
+    def add_mouse_hold(self, insert_index=None):
+        """Add mouse hold command"""
+        if not self.current_macro:
+            messagebox.showwarning("Warning", "Please select a macro first")
+            return
+        
+        button = self.show_input_dialog("Mouse Hold", "Enter button to hold (left/right/middle):", "left")
+        if button:
+            x, y = self.get_mouse_position()
+            if x is not None:
+                self.save_state()
+                cmd = MouseHoldCommand(button, x, y)
+                if insert_index is not None:
+                    self.current_macro.commands.insert(insert_index, cmd)
+                    self.selected_index = insert_index
+                else:
+                    self.current_macro.add_command(cmd)
+                    self.selected_index = len(self.current_macro.commands) - 1
+                self.update_command_list()
+                self.save_macros()
+            else:
+                messagebox.showwarning("Cancelled", "Mouse position capture was cancelled.")
+    
+    def add_mouse_release(self, insert_index=None):
+        """Add mouse release command"""
+        if not self.current_macro:
+            messagebox.showwarning("Warning", "Please select a macro first")
+            return
+        
+        button = self.show_input_dialog("Mouse Release", "Enter button to release (left/right/middle):", "left")
+        if button:
+            x, y = self.get_mouse_position()
+            if x is not None:
+                self.save_state()
+                cmd = MouseReleaseCommand(button, x, y)
+                if insert_index is not None:
+                    self.current_macro.commands.insert(insert_index, cmd)
+                    self.selected_index = insert_index
+                else:
+                    self.current_macro.add_command(cmd)
+                    self.selected_index = len(self.current_macro.commands) - 1
+                self.update_command_list()
+                self.save_macros()
+            else:
+                messagebox.showwarning("Cancelled", "Mouse position capture was cancelled.")
+    
     def add_if(self, insert_index=None):
         """Add IF statement"""
         if not self.current_macro:
@@ -4744,6 +5206,56 @@ class MacroMakerApp:
             self.selected_index = len(self.current_macro.commands) - 1
         self.update_command_list()
         self.save_macros()
+    
+    def add_label(self, insert_index=None):
+        """Add LABEL command"""
+        if not self.current_macro:
+            messagebox.showwarning("Warning", "Please select a macro first")
+            return
+        
+        label_name = self.show_input_dialog("Label", "Enter label name:", "", "str")
+        if label_name is not None and label_name.strip():
+            self.save_state()
+            cmd = LabelCommand(label_name.strip())
+            if insert_index is not None:
+                self.current_macro.commands.insert(insert_index, cmd)
+                self.selected_index = insert_index
+            else:
+                self.current_macro.add_command(cmd)
+                self.selected_index = len(self.current_macro.commands) - 1
+            self.update_command_list()
+            self.save_macros()
+    
+    def add_goto(self, insert_index=None):
+        """Add GOTO command"""
+        if not self.current_macro:
+            messagebox.showwarning("Warning", "Please select a macro first")
+            return
+        
+        # Get list of available labels in the current macro
+        labels = []
+        for cmd in self.current_macro.commands:
+            if isinstance(cmd, LabelCommand):
+                labels.append(cmd.label_name)
+        
+        if labels:
+            # Show a dialog with dropdown of available labels
+            label_name = self.show_label_selection_dialog("Select Label", "Choose a label to jump to:", labels)
+        else:
+            # If no labels exist, allow manual entry
+            label_name = self.show_input_dialog("Goto", "Enter label name (create labels first for dropdown):", "", "str")
+        
+        if label_name is not None and label_name.strip():
+            self.save_state()
+            cmd = GotoCommand(label_name.strip())
+            if insert_index is not None:
+                self.current_macro.commands.insert(insert_index, cmd)
+                self.selected_index = insert_index
+            else:
+                self.current_macro.add_command(cmd)
+                self.selected_index = len(self.current_macro.commands) - 1
+            self.update_command_list()
+            self.save_macros()
     
     def add_delay(self, insert_index=None):
         """Add delay command"""
@@ -5767,6 +6279,44 @@ class MacroMakerApp:
                         refresh_image_list()
             
             ctk.CTkButton(dialog, text="Add Additional Image", command=add_new_image).pack(pady=10)
+            
+            # Test button and result label
+            test_frame = ctk.CTkFrame(dialog)
+            test_frame.pack(pady=10)
+            
+            test_result_label = ctk.CTkLabel(test_frame, text="", text_color="gray")
+            
+            def test_images():
+                test_result_label.configure(text="Testing...", text_color="gray")
+                dialog.update()
+                
+                found = False
+                found_images = []
+                
+                for img_data in cmd.image_paths:
+                    image_path = img_data["path"]
+                    confidence = img_data["confidence"]
+                    
+                    if os.path.exists(image_path):
+                        try:
+                            location = pyautogui.locateOnScreen(image_path, confidence=confidence)
+                            if location:
+                                found = True
+                                found_images.append(os.path.basename(image_path))
+                        except Exception:
+                            pass
+                
+                if found:
+                    if len(found_images) == 1:
+                        result_text = f"true - Found: {found_images[0]}"
+                    else:
+                        result_text = f"true - Found {len(found_images)} image(s)"
+                    test_result_label.configure(text=result_text, text_color="green")
+                else:
+                    test_result_label.configure(text="false - No images found", text_color="red")
+            
+            ctk.CTkButton(test_frame, text="Test", command=test_images, width=80).pack(side=tk.LEFT, padx=5)
+            test_result_label.pack(side=tk.LEFT, padx=10)
             
             # Move to image checkbox
             move_var = tk.BooleanVar(value=cmd.move_to_image)
