@@ -5017,11 +5017,15 @@ class MacroMakerApp:
             search_region_label.pack(side=tk.LEFT, padx=10)
             
             def select_search_region():
+                dialog.grab_release()  # Release grab to allow region selection
                 dialog.withdraw()
                 dialog.update()
                 time.sleep(0.15)  # Small delay to ensure clean state
                 result = self.capture_screen_region()
+                if not dialog.winfo_exists():
+                    return  # Dialog was closed during region selection
                 dialog.deiconify()
+                dialog.grab_set()  # Restore grab
                 if result:
                     _, region = result
                     search_region_data['region'] = region
@@ -5112,11 +5116,15 @@ class MacroMakerApp:
             search_region_label.pack(side=tk.LEFT, padx=10)
             
             def select_search_region():
+                dialog.grab_release()  # Release grab to allow region selection
                 dialog.withdraw()
                 dialog.update()
                 time.sleep(0.15)  # Small delay to ensure clean state
                 result = self.capture_screen_region()
+                if not dialog.winfo_exists():
+                    return  # Dialog was closed during region selection
                 dialog.deiconify()
+                dialog.grab_set()  # Restore grab
                 if result:
                     _, region = result
                     search_region_data['region'] = region
@@ -6480,11 +6488,15 @@ class MacroMakerApp:
             search_region_label.pack(side=tk.LEFT, padx=10)
             
             def select_search_region():
+                dialog.grab_release()  # Release grab to allow region selection
                 dialog.withdraw()
                 dialog.update()
                 time.sleep(0.15)  # Small delay to ensure clean state
                 result = self.capture_screen_region()
+                if not dialog.winfo_exists():
+                    return  # Dialog was closed during region selection
                 dialog.deiconify()
+                dialog.grab_set()  # Restore grab
                 if result:
                     _, region = result
                     search_region_data['region'] = region
@@ -6588,11 +6600,15 @@ class MacroMakerApp:
             search_region_label.pack(side=tk.LEFT, padx=10)
             
             def select_search_region():
+                dialog.grab_release()  # Release grab to allow region selection
                 dialog.withdraw()
                 dialog.update()
                 time.sleep(0.15)  # Small delay to ensure clean state
                 result = self.capture_screen_region()
+                if not dialog.winfo_exists():
+                    return  # Dialog was closed during region selection
                 dialog.deiconify()
+                dialog.grab_set()  # Restore grab
                 if result:
                     _, region = result
                     search_region_data['region'] = region
