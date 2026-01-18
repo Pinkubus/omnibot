@@ -3700,12 +3700,16 @@ class MacroMakerApp:
         
         ctk.CTkLabel(dialog, text="Press the key combination you want to use:").pack(pady=20)
         
-        hotkey_label = ctk.CTkLabel(dialog, text="Waiting...", font=("Arial", 14, "bold"))
+        hotkey_label = ctk.CTkLabel(dialog, text="Release all keys...", font=("Arial", 14, "bold"))
         hotkey_label.pack(pady=10)
         
         captured_keys = []
+        listening_state = {'active': False}
         
         def on_key(event):
+            # Ignore keys until we're actively listening
+            if not listening_state['active']:
+                return
             key = event.name
             # Don't capture Enter or Escape as part of the hotkey
             if key in ['enter', 'return', 'esc', 'escape']:
@@ -3714,7 +3718,19 @@ class MacroMakerApp:
                 captured_keys.append(key)
                 hotkey_label.configure(text=" + ".join(captured_keys))
         
+        def start_listening():
+            # Wait until all keys are released, then start listening
+            if keyboard.is_pressed('ctrl') or keyboard.is_pressed('alt') or keyboard.is_pressed('shift') or keyboard.is_pressed('win'):
+                # Keys still pressed, check again soon
+                dialog.after(50, start_listening)
+                return
+            # All keys released, start listening
+            listening_state['active'] = True
+            hotkey_label.configure(text="Waiting...")
+        
         keyboard.hook(on_key)
+        # Delay starting to listen until keys are released
+        dialog.after(100, start_listening)
         
         def restore_hotkeys():
             """Restore all temporarily disabled hotkeys"""
@@ -4512,7 +4528,7 @@ class MacroMakerApp:
         selection_window.attributes('-fullscreen', True)
         selection_window.attributes('-alpha', 0.3)
         selection_window.attributes('-topmost', True)
-        selection_window.configure(bg='black')
+        selection_window.configure(bg='black', cursor='cross')
         
         canvas = tk.Canvas(selection_window, cursor='cross', bg='black', highlightthickness=0)
         canvas.pack(fill=tk.BOTH, expand=True)
@@ -4520,6 +4536,9 @@ class MacroMakerApp:
         coords = {'x1': 0, 'y1': 0, 'x2': 0, 'y2': 0, 'rect': None, 'done': False}
         
         def on_press(event):
+            # Force cursor to stay as crosshair during drag
+            canvas.config(cursor='cross')
+            selection_window.config(cursor='cross')
             coords['x1'] = event.x
             coords['y1'] = event.y
             if coords['rect']:
@@ -4527,6 +4546,8 @@ class MacroMakerApp:
             coords['rect'] = canvas.create_rectangle(coords['x1'], coords['y1'], coords['x1'], coords['y1'], outline='red', width=2)
         
         def on_drag(event):
+            # Ensure cursor stays as crosshair
+            canvas.config(cursor='cross')
             coords['x2'] = event.x
             coords['y2'] = event.y
             if coords['rect']:
@@ -4541,6 +4562,13 @@ class MacroMakerApp:
         canvas.bind('<ButtonPress-1>', on_press)
         canvas.bind('<B1-Motion>', on_drag)
         canvas.bind('<ButtonRelease-1>', on_release)
+        
+        # Bind Escape to cancel
+        selection_window.bind('<Escape>', lambda e: selection_window.destroy())
+        
+        # Force focus to the selection window
+        selection_window.focus_force()
+        canvas.focus_set()
         
         # Wait for selection
         selection_window.wait_window()
@@ -4905,12 +4933,14 @@ class MacroMakerApp:
                 search_region = None
                 if search_area_var.get():
                     # Capture search area
-                    messagebox.showinfo("Search Area", "Click and drag to select the area to search within.")
+                    dialog.withdraw()
+                    dialog.update()
+                    time.sleep(0.15)  # Small delay to ensure clean state
                     result = self.capture_screen_region()
+                    dialog.deiconify()
                     if result:
                         search_screenshot, search_region = result
                     else:
-                        messagebox.showwarning("Warning", "No search area selected. Searching entire screen.")
                         search_region = None
                 
                 self.save_state()
@@ -4973,13 +5003,47 @@ class MacroMakerApp:
             move_check = ctk.CTkCheckBox(dialog, text="Move mouse to image if found", variable=move_var)
             move_check.pack(pady=10)
             
+            # Search within area checkbox and region storage
+            search_area_var = tk.BooleanVar(value=False)
+            search_region_data = {'region': None}
+            
+            search_frame = ctk.CTkFrame(dialog)
+            search_frame.pack(pady=10, padx=10, fill=tk.X)
+            
+            search_check = ctk.CTkCheckBox(search_frame, text="Search within area", variable=search_area_var)
+            search_check.pack(side=tk.LEFT, padx=5)
+            
+            search_region_label = ctk.CTkLabel(search_frame, text="", text_color="gray")
+            search_region_label.pack(side=tk.LEFT, padx=10)
+            
+            def select_search_region():
+                dialog.withdraw()
+                dialog.update()
+                time.sleep(0.15)  # Small delay to ensure clean state
+                result = self.capture_screen_region()
+                dialog.deiconify()
+                if result:
+                    _, region = result
+                    search_region_data['region'] = region
+                    search_area_var.set(True)
+                    search_region_label.configure(text=f"({region[0]}, {region[1]}) to ({region[2]}, {region[3]})")
+                else:
+                    search_region_data['region'] = None
+                    search_area_var.set(False)
+                    search_region_label.configure(text="")
+            
+            select_region_btn = ctk.CTkButton(search_frame, text="Select Region", command=select_search_region, width=100)
+            select_region_btn.pack(side=tk.LEFT, padx=5)
+            
             def save_options():
                 try:
                     conf_value = float(conf_var.get())
                     conf_value = max(0.1, min(1.0, conf_value))
                 except ValueError:
                     conf_value = 0.8
-                self.current_macro.commands.insert(insert_index, IfImageCommand(image_path, conf_value, move_var.get()))
+                
+                search_region = search_region_data['region'] if search_area_var.get() else None
+                self.current_macro.commands.insert(insert_index, IfImageCommand(image_path, conf_value, move_var.get(), None, search_region))
                 # Auto-insert ENDIF right after IF IMAGE
                 self.current_macro.commands.insert(insert_index + 1, EndIfStatementCommand())
                 self.update_command_list()
@@ -4994,7 +5058,7 @@ class MacroMakerApp:
             cancel_btn.pack(side=tk.LEFT, padx=5)
             
             # Set up tab navigation
-            self.setup_dialog_tab_order(dialog, [conf_entry, move_check, ok_btn, cancel_btn])
+            self.setup_dialog_tab_order(dialog, [conf_entry, move_check, search_check, select_region_btn, ok_btn, cancel_btn])
             
             # Bind keyboard shortcuts
             dialog.bind('<Return>', lambda e: save_options())
@@ -5020,13 +5084,86 @@ class MacroMakerApp:
             
             self.show_image_preview(screenshot, "Captured Image")
             
-            confidence = self.show_input_dialog("Confidence", "Enter confidence (0.0-1.0):", 0.8, "float")
-            if confidence is not None:
+            # Create dialog for options
+            dialog = ctk.CTkToplevel(self.root)
+            dialog.title("FIND IMAGE Options")
+            dialog.transient(self.root)
+            dialog.grab_set()
+            
+            # Confidence entry
+            conf_frame = ctk.CTkFrame(dialog)
+            conf_frame.pack(pady=10, padx=10, fill=tk.X)
+            ctk.CTkLabel(conf_frame, text="Confidence (0.1-1.0):").pack(side=tk.LEFT, padx=5)
+            conf_var = tk.StringVar(value="0.80")
+            conf_entry = ctk.CTkEntry(conf_frame, textvariable=conf_var, width=80)
+            conf_entry.pack(side=tk.LEFT, padx=5)
+            
+            # Search within area checkbox and region storage
+            search_area_var = tk.BooleanVar(value=False)
+            search_region_data = {'region': None}
+            
+            search_frame = ctk.CTkFrame(dialog)
+            search_frame.pack(pady=10, padx=10, fill=tk.X)
+            
+            search_check = ctk.CTkCheckBox(search_frame, text="Search within area", variable=search_area_var)
+            search_check.pack(side=tk.LEFT, padx=5)
+            
+            search_region_label = ctk.CTkLabel(search_frame, text="", text_color="gray")
+            search_region_label.pack(side=tk.LEFT, padx=10)
+            
+            def select_search_region():
+                dialog.withdraw()
+                dialog.update()
+                time.sleep(0.15)  # Small delay to ensure clean state
+                result = self.capture_screen_region()
+                dialog.deiconify()
+                if result:
+                    _, region = result
+                    search_region_data['region'] = region
+                    search_area_var.set(True)
+                    search_region_label.configure(text=f"({region[0]}, {region[1]}) to ({region[2]}, {region[3]})")
+                else:
+                    search_region_data['region'] = None
+                    search_area_var.set(False)
+                    search_region_label.configure(text="")
+            
+            select_region_btn = ctk.CTkButton(search_frame, text="Select Region", command=select_search_region, width=100)
+            select_region_btn.pack(side=tk.LEFT, padx=5)
+            
+            # Buttons
+            def save_options():
+                try:
+                    conf_value = float(conf_var.get())
+                    conf_value = max(0.1, min(1.0, conf_value))
+                except ValueError:
+                    conf_value = 0.8
+                
+                search_region = search_region_data['region'] if search_area_var.get() else None
                 self.save_state()
-                self.current_macro.commands.insert(insert_index, FindImageCommand(image_path, confidence))
+                self.current_macro.commands.insert(insert_index, FindImageCommand(image_path, conf_value, search_region))
                 self.selected_index = insert_index
                 self.update_command_list()
                 self.save_macros()
+                dialog.destroy()
+            
+            btn_frame = ctk.CTkFrame(dialog)
+            btn_frame.pack(pady=20)
+            ok_btn = ctk.CTkButton(btn_frame, text="OK", command=save_options, width=100)
+            ok_btn.pack(side=tk.LEFT, padx=5)
+            cancel_btn = ctk.CTkButton(btn_frame, text="Cancel", command=dialog.destroy, width=100)
+            cancel_btn.pack(side=tk.LEFT, padx=5)
+            
+            # Set up tab navigation
+            self.setup_dialog_tab_order(dialog, [conf_entry, search_check, select_region_btn, ok_btn, cancel_btn])
+            
+            # Bind keyboard shortcuts
+            dialog.bind('<Return>', lambda e: save_options())
+            dialog.bind('<Escape>', lambda e: dialog.destroy())
+            
+            # Auto-size and center dialog
+            schedule_autosize(dialog)
+            
+            self.ensure_dialog_focused(dialog)
     
     def add_find_image(self):
         """Add FIND IMAGE command"""
@@ -5080,12 +5217,14 @@ class MacroMakerApp:
                 search_region = None
                 if search_area_var.get():
                     # Capture search area
-                    messagebox.showinfo("Search Area", "Click and drag to select the area to search within.")
+                    dialog.withdraw()
+                    dialog.update()
+                    time.sleep(0.15)  # Small delay to ensure clean state
                     result = self.capture_screen_region()
+                    dialog.deiconify()
                     if result:
                         search_screenshot, search_region = result
                     else:
-                        messagebox.showwarning("Warning", "No search area selected. Searching entire screen.")
                         search_region = None
                 
                 self.save_state()
@@ -6323,6 +6462,49 @@ class MacroMakerApp:
             move_check = ctk.CTkCheckBox(dialog, text="Move mouse to image if found", variable=move_var)
             move_check.pack(pady=10)
             
+            # Search region section
+            search_frame = ctk.CTkFrame(dialog)
+            search_frame.pack(pady=10, padx=10, fill=tk.X)
+            
+            search_area_var = tk.BooleanVar(value=cmd.search_region is not None)
+            search_region_data = {'region': cmd.search_region}
+            
+            search_check = ctk.CTkCheckBox(search_frame, text="Search within area", variable=search_area_var)
+            search_check.pack(side=tk.LEFT, padx=5)
+            
+            region_text = ""
+            if cmd.search_region:
+                r = cmd.search_region
+                region_text = f"({r[0]}, {r[1]}) to ({r[2]}, {r[3]})"
+            search_region_label = ctk.CTkLabel(search_frame, text=region_text, text_color="gray")
+            search_region_label.pack(side=tk.LEFT, padx=10)
+            
+            def select_search_region():
+                dialog.withdraw()
+                dialog.update()
+                time.sleep(0.15)  # Small delay to ensure clean state
+                result = self.capture_screen_region()
+                dialog.deiconify()
+                if result:
+                    _, region = result
+                    search_region_data['region'] = region
+                    search_area_var.set(True)
+                    search_region_label.configure(text=f"({region[0]}, {region[1]}) to ({region[2]}, {region[3]})")
+                else:
+                    if not search_region_data['region']:
+                        search_area_var.set(False)
+                        search_region_label.configure(text="")
+            
+            def clear_search_region():
+                search_region_data['region'] = None
+                search_area_var.set(False)
+                search_region_label.configure(text="")
+            
+            select_region_btn = ctk.CTkButton(search_frame, text="Select Region", command=select_search_region, width=100)
+            select_region_btn.pack(side=tk.LEFT, padx=5)
+            clear_region_btn = ctk.CTkButton(search_frame, text="Clear", command=clear_search_region, width=60)
+            clear_region_btn.pack(side=tk.LEFT, padx=5)
+            
             # Save/Cancel buttons
             btn_frame = ctk.CTkFrame(dialog)
             btn_frame.pack(pady=20)
@@ -6330,6 +6512,7 @@ class MacroMakerApp:
             def save_changes():
                 self.save_state()
                 cmd.move_to_image = move_var.get()
+                cmd.search_region = search_region_data['region'] if search_area_var.get() else None
                 # Update primary image_path and confidence for backwards compatibility
                 if cmd.image_paths:
                     cmd.image_path = cmd.image_paths[0]["path"]
@@ -6349,7 +6532,7 @@ class MacroMakerApp:
             cancel_btn.pack(side=tk.LEFT, padx=5)
             
             # Set up tab navigation
-            self.setup_dialog_tab_order(dialog, [move_check, save_btn, cancel_btn])
+            self.setup_dialog_tab_order(dialog, [move_check, search_check, select_region_btn, clear_region_btn, save_btn, cancel_btn])
             
             # Bind Enter and Escape
             dialog.bind('<Return>', lambda e: save_changes())
@@ -6387,6 +6570,49 @@ class MacroMakerApp:
             conf_entry = ctk.CTkEntry(conf_frame, textvariable=conf_var, width=100)
             conf_entry.pack(side=tk.LEFT, padx=5)
             
+            # Search region section
+            search_frame = ctk.CTkFrame(dialog)
+            search_frame.pack(pady=10, padx=10, fill=tk.X)
+            
+            search_area_var = tk.BooleanVar(value=cmd.search_region is not None)
+            search_region_data = {'region': cmd.search_region}
+            
+            search_check = ctk.CTkCheckBox(search_frame, text="Search within area", variable=search_area_var)
+            search_check.pack(side=tk.LEFT, padx=5)
+            
+            region_text = ""
+            if cmd.search_region:
+                r = cmd.search_region
+                region_text = f"({r[0]}, {r[1]}) to ({r[2]}, {r[3]})"
+            search_region_label = ctk.CTkLabel(search_frame, text=region_text, text_color="gray")
+            search_region_label.pack(side=tk.LEFT, padx=10)
+            
+            def select_search_region():
+                dialog.withdraw()
+                dialog.update()
+                time.sleep(0.15)  # Small delay to ensure clean state
+                result = self.capture_screen_region()
+                dialog.deiconify()
+                if result:
+                    _, region = result
+                    search_region_data['region'] = region
+                    search_area_var.set(True)
+                    search_region_label.configure(text=f"({region[0]}, {region[1]}) to ({region[2]}, {region[3]})")
+                else:
+                    if not search_region_data['region']:
+                        search_area_var.set(False)
+                        search_region_label.configure(text="")
+            
+            def clear_search_region():
+                search_region_data['region'] = None
+                search_area_var.set(False)
+                search_region_label.configure(text="")
+            
+            select_region_btn = ctk.CTkButton(search_frame, text="Select Region", command=select_search_region, width=100)
+            select_region_btn.pack(side=tk.LEFT, padx=5)
+            clear_region_btn = ctk.CTkButton(search_frame, text="Clear", command=clear_search_region, width=60)
+            clear_region_btn.pack(side=tk.LEFT, padx=5)
+            
             # Buttons
             btn_frame = ctk.CTkFrame(dialog)
             btn_frame.pack(pady=20)
@@ -6414,6 +6640,7 @@ class MacroMakerApp:
                 except ValueError:
                     conf_value = 0.8
                 cmd.confidence = conf_value
+                cmd.search_region = search_region_data['region'] if search_area_var.get() else None
                 self.update_command_list()
                 self.save_macros()
                 dialog.grab_release()
@@ -6423,14 +6650,15 @@ class MacroMakerApp:
                 dialog.grab_release()
                 dialog.destroy()
             
-            ctk.CTkButton(btn_frame, text="Recapture Image", command=recapture, width=120).pack(side=tk.LEFT, padx=5)
+            recapture_btn = ctk.CTkButton(btn_frame, text="Recapture Image", command=recapture, width=120)
+            recapture_btn.pack(side=tk.LEFT, padx=5)
             save_btn = ctk.CTkButton(btn_frame, text="Save", command=save_changes, width=80)
             save_btn.pack(side=tk.LEFT, padx=5)
             cancel_btn = ctk.CTkButton(btn_frame, text="Cancel", command=cancel_dialog, width=80)
             cancel_btn.pack(side=tk.LEFT, padx=5)
             
             # Set up tab navigation
-            self.setup_dialog_tab_order(dialog, [conf_entry, save_btn, cancel_btn])
+            self.setup_dialog_tab_order(dialog, [conf_entry, search_check, select_region_btn, clear_region_btn, recapture_btn, save_btn, cancel_btn])
             
             # Bind Enter and Escape
             dialog.bind('<Return>', lambda e: save_changes())
