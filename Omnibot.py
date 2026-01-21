@@ -1867,6 +1867,7 @@ class MacroExecutor:
     def stop(self):
         """Stop the currently running macro"""
         self.stop_flag = True
+        self.running = False
 
 
 class MacroMakerApp:
