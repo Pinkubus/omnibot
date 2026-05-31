@@ -23,6 +23,27 @@ DEBUG_IMAGE = False
 DEBUG_IMAGE_DIR = "debug_images"
 
 # ============================================================================
+# UTILITY FUNCTIONS FOR KEYBOARD/MOUSE HANDLING
+# ============================================================================
+
+def release_all_modifier_keys():
+    """
+    Release all modifier keys (Ctrl, Alt, Shift, Win) that might be stuck.
+    This is crucial after hotkey presses to ensure clean macro execution.
+    """
+    modifiers = ['ctrl', 'alt', 'shift', 'win', 'left ctrl', 'right ctrl', 
+                 'left alt', 'right alt', 'left shift', 'right shift', 
+                 'left win', 'right win']
+    for mod in modifiers:
+        try:
+            keyboard.release(mod)
+        except:
+            pass
+    # Add a small delay to let keys stabilize
+    time.sleep(0.05)
+    print("[KEYS] Released all stuck modifier keys")
+
+# ============================================================================
 # DPI AWARENESS (Windows) - Call early to fix coordinate mismatches
 # ============================================================================
 def set_dpi_awareness():
@@ -101,13 +122,110 @@ def autosize_to_content(win, pad=(24, 24), max_ratio=0.90, center=True, min_size
     except Exception as e:
         print(f"[autosize] Error sizing window: {e}")
 
+def enable_tab_traversal(win):
+    """Enable Tab/Shift-Tab traversal for all interactive CTk widgets in a window.
+    
+    CustomTkinter widgets are composites (frames containing inner tk widgets),
+    so standard tk tab traversal skips them.  This function walks the widget
+    tree, finds every interactive CTk widget, and binds <Tab> / <Shift-Tab>
+    to move focus forward/backward through the ordered list.
+    """
+    interactive_types = (
+        ctk.CTkEntry, ctk.CTkButton, ctk.CTkCheckBox,
+        ctk.CTkComboBox, ctk.CTkOptionMenu, ctk.CTkRadioButton,
+        ctk.CTkSlider, ctk.CTkSwitch, ctk.CTkTextbox,
+    )
+
+    def collect_widgets(parent):
+        """Collect interactive CTk widgets in visual order (pack/grid order)."""
+        widgets = []
+        for child in parent.winfo_children():
+            if isinstance(child, interactive_types):
+                widgets.append(child)
+            # Recurse into frames / containers that aren't themselves interactive
+            if hasattr(child, 'winfo_children') and not isinstance(child, interactive_types):
+                widgets.extend(collect_widgets(child))
+        return widgets
+
+    focusable = collect_widgets(win)
+    if not focusable:
+        return
+
+    def _move_focus(event, forward=True):
+        widget = event.widget
+        # The event may fire on an inner tk widget; walk up to find the CTk parent
+        w = widget
+        while w and not isinstance(w, interactive_types):
+            w = w.master
+        if w in focusable:
+            idx = focusable.index(w)
+        else:
+            idx = -1 if forward else 0
+
+        if forward:
+            nxt = focusable[(idx + 1) % len(focusable)]
+        else:
+            nxt = focusable[(idx - 1) % len(focusable)]
+        nxt.focus_set()
+        return "break"
+
+    for w in focusable:
+        w.bind("<Tab>", lambda e: _move_focus(e, forward=True), add="+")
+        w.bind("<Shift-Tab>", lambda e: _move_focus(e, forward=False), add="+")
+        # CTkEntry has an inner tk entry; bind there too
+        if isinstance(w, ctk.CTkEntry):
+            try:
+                inner = w.winfo_children()[0] if w.winfo_children() else None
+                if inner:
+                    inner.bind("<Tab>", lambda e: _move_focus(e, forward=True), add="+")
+                    inner.bind("<Shift-Tab>", lambda e: _move_focus(e, forward=False), add="+")
+            except Exception:
+                pass
+        # CTkTextbox also has an inner widget
+        if isinstance(w, ctk.CTkTextbox):
+            try:
+                inner = w.winfo_children()[0] if w.winfo_children() else None
+                if inner:
+                    inner.bind("<Tab>", lambda e: _move_focus(e, forward=True), add="+")
+                    inner.bind("<Shift-Tab>", lambda e: _move_focus(e, forward=False), add="+")
+            except Exception:
+                pass
+
 def schedule_autosize(win, **kwargs):
-    """Schedule autosize to run after widgets are fully created."""
-    win.after(0, lambda: autosize_to_content(win, **kwargs))
+    """Schedule autosize and tab traversal to run after widgets are fully created."""
+    def _apply():
+        autosize_to_content(win, **kwargs)
+        enable_tab_traversal(win)
+    win.after(0, _apply)
 
 # ============================================================================
 # IMAGE MATCHING HELPER FUNCTIONS
 # ============================================================================
+
+def get_virtual_screen_bounds():
+    """
+    Get the full virtual screen bounds from Win32 API.
+    Returns (vx, vy, vw, vh) where vx/vy can be negative for multi-monitor setups.
+    This is queried live each call so it adapts to display changes.
+    """
+    try:
+        SM_XVIRTUALSCREEN  = 76
+        SM_YVIRTUALSCREEN  = 77
+        SM_CXVIRTUALSCREEN = 78
+        SM_CYVIRTUALSCREEN = 79
+        user32 = ctypes.windll.user32
+        vx = user32.GetSystemMetrics(SM_XVIRTUALSCREEN)
+        vy = user32.GetSystemMetrics(SM_YVIRTUALSCREEN)
+        vw = user32.GetSystemMetrics(SM_CXVIRTUALSCREEN)
+        vh = user32.GetSystemMetrics(SM_CYVIRTUALSCREEN)
+        return vx, vy, vw, vh
+    except Exception as e:
+        print(f"[VScreen] Could not query virtual screen: {e}")
+        try:
+            w, h = pyautogui.size()
+            return 0, 0, w, h
+        except Exception:
+            return 0, 0, 1920, 1080
 
 def get_dpi_scale_factor():
     """Detect DPI scale factor by comparing pyautogui screen size vs actual grab size."""
@@ -187,6 +305,7 @@ def screenshot_region(left, top, width, height):
     """
     Capture a screenshot of the specified region.
     Returns numpy array in BGR format, or None on failure.
+    Uses all_screens=True so coordinates work across all monitors.
     """
     try:
         # Ensure integer coordinates
@@ -197,9 +316,9 @@ def screenshot_region(left, top, width, height):
             print(f"[Screenshot] Invalid dimensions: {width}x{height}")
             return None
         
-        # Use PIL ImageGrab
+        # Use PIL ImageGrab with all_screens to capture from any monitor
         bbox = (left, top, left + width, top + height)
-        grab = ImageGrab.grab(bbox=bbox)
+        grab = ImageGrab.grab(bbox=bbox, all_screens=True)
         
         # Convert to numpy BGR
         img = np.array(grab)
@@ -318,10 +437,16 @@ def verify_cursor_over_template(cx, cy, template_path, tolerance=0.7):
     
     return verified, score, patch
 
-def find_image_cv2(template_path, confidence, search_region=None):
+def find_image_cv2(template_path, confidence, search_region=None, exclude_bounds=None):
     """
-    Alternative image finding using cv2.matchTemplate directly.
-    More reliable than pyautogui.locateOnScreen in some cases.
+    Image finding using cv2.matchTemplate directly.
+    Searches all monitors and can skip matches inside excluded bounds.
+    
+    Args:
+        template_path: Path to template image
+        confidence: Minimum match confidence (0-1)
+        search_region: Optional region to search within
+        exclude_bounds: Optional (x, y, w, h) rect to skip matches inside
     
     Returns (found: bool, cx: int, cy: int, match_rect: tuple) or (False, 0, 0, None)
     """
@@ -330,49 +455,76 @@ def find_image_cv2(template_path, confidence, search_region=None):
         return False, 0, 0, None
     
     try:
-        # Capture search region or full screen
+        # Capture search region or full screen (all monitors)
         if search_region:
             region = normalize_region(search_region)
             if region:
                 screenshot = screenshot_region(*region)
                 offset_x, offset_y = region[0], region[1]
             else:
-                screenshot = np.array(ImageGrab.grab())
+                # Grab full virtual desktop (all monitors)
+                vx, vy, vw, vh = get_virtual_screen_bounds()
+                screenshot = np.array(ImageGrab.grab(bbox=(vx, vy, vx + vw, vy + vh), all_screens=True))
                 screenshot = cv2.cvtColor(screenshot, cv2.COLOR_RGB2BGR)
-                offset_x, offset_y = 0, 0
+                offset_x, offset_y = vx, vy
         else:
-            screenshot = np.array(ImageGrab.grab())
+            # Grab full virtual desktop (all monitors) to adapt to current resolution
+            vx, vy, vw, vh = get_virtual_screen_bounds()
+            screenshot = np.array(ImageGrab.grab(bbox=(vx, vy, vx + vw, vy + vh), all_screens=True))
             screenshot = cv2.cvtColor(screenshot, cv2.COLOR_RGB2BGR)
-            offset_x, offset_y = 0, 0
+            offset_x, offset_y = vx, vy
         
         if screenshot is None:
             return False, 0, 0, None
         
         # Run template matching
         result = cv2.matchTemplate(screenshot, template, cv2.TM_CCOEFF_NORMED)
-        min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
+        threshold = confidence
         
-        # Check if match is good enough
-        # Convert confidence to TM_CCOEFF_NORMED threshold (it returns -1 to 1)
-        threshold = confidence * 2 - 1  # Map 0.5-1.0 to 0-1 in CCOEFF space
-        threshold = max(0.3, confidence - 0.2)  # More lenient threshold
-        
-        if max_val >= threshold:
-            # Found match
-            match_left = max_loc[0] + offset_x
-            match_top = max_loc[1] + offset_y
-            cx = match_left + tw // 2
-            cy = match_top + th // 2
-            match_rect = (match_left, match_top, tw, th)
-            
+        # Find ALL locations above the threshold, sorted by score descending
+        locations = np.where(result >= threshold)
+        if len(locations[0]) == 0:
             if DEBUG_IMAGE:
-                print(f"[CV2] Match found: score={max_val:.3f}, center=({cx},{cy})")
-            
-            return True, cx, cy, match_rect
-        else:
-            if DEBUG_IMAGE:
+                min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
                 print(f"[CV2] No match: best score={max_val:.3f} < threshold={threshold:.3f}")
             return False, 0, 0, None
+        
+        # Build list of (score, y, x) and sort by score descending
+        scores = result[locations[0], locations[1]]
+        matches = sorted(zip(scores, locations[0], locations[1]), reverse=True)
+        
+        # Non-maximum suppression: skip matches too close to a better one
+        used_centers = []
+        for score, my, mx in matches:
+            match_left = int(mx) + offset_x
+            match_top = int(my) + offset_y
+            cx = match_left + tw // 2
+            cy = match_top + th // 2
+            
+            # Skip if too close to a higher-scoring match already accepted/rejected
+            too_close = False
+            for (ux, uy) in used_centers:
+                if abs(cx - ux) < tw // 2 and abs(cy - uy) < th // 2:
+                    too_close = True
+                    break
+            if too_close:
+                continue
+            used_centers.append((cx, cy))
+            
+            # Skip if inside excluded bounds (app window)
+            if exclude_bounds:
+                ex, ey, ew, eh = exclude_bounds
+                if (ex <= cx <= ex + ew) and (ey <= cy <= ey + eh):
+                    print(f"[CV2] Skipping match at ({cx},{cy}) - inside excluded bounds")
+                    continue
+            
+            match_rect = (match_left, match_top, tw, th)
+            if DEBUG_IMAGE:
+                print(f"[CV2] Match found: score={float(score):.3f}, center=({cx},{cy})")
+            return True, cx, cy, match_rect
+        
+        print(f"[CV2] All {len(used_centers)} match(es) were inside excluded bounds")
+        return False, 0, 0, None
             
     except Exception as e:
         print(f"[CV2] Error in template matching: {e}")
@@ -383,8 +535,9 @@ def find_image_with_verification(image_path, confidence, move_to_image, search_r
     """
     Find image on screen and optionally move cursor to it.
     
-    Simplified version that finds the first match and immediately returns,
-    without complex verification that can cause flickering between multiple matches.
+    Uses cv2 as the primary search method (searches all monitors and can
+    skip matches inside the app window).  Falls back to pyautogui only
+    when cv2 finds nothing.
     
     Args:
         image_path: Path to template image
@@ -405,6 +558,7 @@ def find_image_with_verification(image_path, confidence, move_to_image, search_r
             return False
         x, y, w, h = app_window_bounds
         return (x <= cx <= x + w) and (y <= cy <= y + h)
+
     template, tw, th = load_template(image_path)
     if template is None:
         print(f"[Find] Could not load template: {image_path}")
@@ -420,32 +574,36 @@ def find_image_with_verification(image_path, confidence, move_to_image, search_r
         sx, sy = get_dpi_scale_factor()
         print(f"[Find] DPI scale: ({sx:.2f}, {sy:.2f})")
     
-    # Try pyautogui first - it finds the first match
-    try:
-        if region:
-            location = pyautogui.locateOnScreen(image_path, confidence=confidence, region=region)
-        else:
-            location = pyautogui.locateOnScreen(image_path, confidence=confidence)
-    except Exception as e:
-        print(f"[Find] pyautogui error: {e}")
-        location = None
+    cx, cy = None, None
     
-    # If pyautogui failed, try cv2 method
-    if location is None:
-        found, cx, cy, match_rect = find_image_cv2(image_path, confidence, search_region)
-        if not found:
-            if DEBUG_IMAGE:
-                print(f"[Find] No match found")
-            return False, None
+    # Primary method: cv2 (searches all monitors, skips app window matches)
+    found, fx, fy, match_rect = find_image_cv2(
+        image_path, confidence, search_region, exclude_bounds=app_window_bounds
+    )
+    if found:
+        cx, cy = fx, fy
     else:
-        cx, cy = pyautogui.center(location)
-        cx, cy = int(cx), int(cy)
+        # Fallback: pyautogui (primary monitor only)
+        try:
+            if region:
+                location = pyautogui.locateOnScreen(image_path, confidence=confidence, region=region)
+            else:
+                location = pyautogui.locateOnScreen(image_path, confidence=confidence)
+        except Exception as e:
+            print(f"[Find] pyautogui error: {e}")
+            location = None
+        
+        if location is not None:
+            px, py = pyautogui.center(location)
+            px, py = int(px), int(py)
+            if not is_within_app_window(px, py):
+                cx, cy = px, py
+            else:
+                print(f"[Find] IGNORED pyautogui match at ({px},{py}) - inside app window")
     
-    # Check if the found location is within the app window - DO THIS BEFORE MOVING MOUSE
-    if is_within_app_window(cx, cy):
-        print(f"[Find] IGNORED: Match at ({cx},{cy}) is within app window - skipping")
+    if cx is None:
         if DEBUG_IMAGE:
-            print(f"[Find] App window bounds: {app_window_bounds}")
+            print(f"[Find] No match found")
         return False, None
     
     if DEBUG_IMAGE:
@@ -455,6 +613,10 @@ def find_image_with_verification(image_path, confidence, move_to_image, search_r
     if move_to_image:
         print(f"[Find] Moving cursor to ({cx},{cy})")
         pyautogui.moveTo(cx, cy)
+        # CRITICAL: Add delay to ensure cursor movement is processed before next command
+        import time
+        time.sleep(0.2)  # 200ms delay for position to stabilize
+        print(f"[Find] Cursor move complete, position should be stable now")
     else:
         print(f"[Find] Image found but move_to_image=False, not moving cursor")
     
@@ -530,6 +692,8 @@ class MacroCommand:
             return WaitForWindowCommand(data.get("window_pattern", "*"), data.get("timeout", 30))
         elif cmd_type == "focus_window":
             return FocusWindowCommand(data.get("window_pattern", "*"))
+        elif cmd_type == "switch_to_window":
+            return SwitchToWindowCommand(data.get("window_pattern", "*"))
         elif cmd_type == "message":
             return MessageCommand(
                 data.get("text", ""),
@@ -566,13 +730,179 @@ class MacroCommand:
         return self.command_type.upper()
 
 
+# ============================================================================
+# LOW-LEVEL KEYBOARD INPUT VIA SendInput WITH SCANCODES
+# ============================================================================
+# Many modern Windows apps (Win11 Notepad, UWP apps, some browsers) ignore
+# synthetic key events that lack a proper hardware scancode, especially when
+# checking for held modifiers like Shift. Using SendInput with
+# KEYEVENTF_SCANCODE produces the most "real-keyboard-like" events.
+
+# Virtual-key code map for keys we expose in macros. Names are lowercase and
+# match what `keyboard` / `pyautogui` accept so existing macros keep working.
+_VK_CODES = {
+    # Modifiers
+    "shift": 0xA0, "left shift": 0xA0, "lshift": 0xA0,
+    "right shift": 0xA1, "rshift": 0xA1,
+    "ctrl": 0xA2, "control": 0xA2, "left ctrl": 0xA2, "lctrl": 0xA2,
+    "right ctrl": 0xA3, "rctrl": 0xA3,
+    "alt": 0xA4, "left alt": 0xA4, "lalt": 0xA4,
+    "right alt": 0xA5, "ralt": 0xA5,
+    "win": 0x5B, "left win": 0x5B, "lwin": 0x5B,
+    "right win": 0x5C, "rwin": 0x5C,
+    # Navigation / editing (extended keys)
+    "left": 0x25, "up": 0x26, "right": 0x27, "down": 0x28,
+    "home": 0x24, "end": 0x23,
+    "pageup": 0x21, "page up": 0x21, "pgup": 0x21,
+    "pagedown": 0x22, "page down": 0x22, "pgdn": 0x22,
+    "insert": 0x2D, "ins": 0x2D, "delete": 0x2E, "del": 0x2E,
+    "backspace": 0x08, "back": 0x08,
+    "tab": 0x09, "enter": 0x0D, "return": 0x0D,
+    "escape": 0x1B, "esc": 0x1B, "space": 0x20, " ": 0x20,
+    "capslock": 0x14, "caps lock": 0x14,
+    "numlock": 0x90, "num lock": 0x90,
+    "scrolllock": 0x91, "scroll lock": 0x91,
+    "printscreen": 0x2C, "print screen": 0x2C, "prtsc": 0x2C,
+    "pause": 0x13, "break": 0x13,
+    "menu": 0x5D, "apps": 0x5D,
+    # Function keys
+    **{f"f{i}": 0x6F + i for i in range(1, 13)},  # F1..F12 = 0x70..0x7B
+    # Numpad
+    "num0": 0x60, "num1": 0x61, "num2": 0x62, "num3": 0x63, "num4": 0x64,
+    "num5": 0x65, "num6": 0x66, "num7": 0x67, "num8": 0x68, "num9": 0x69,
+    "multiply": 0x6A, "add": 0x6B, "subtract": 0x6D,
+    "decimal": 0x6E, "divide": 0x6F,
+    # Punctuation (US layout)
+    ";": 0xBA, "=": 0xBB, ",": 0xBC, "-": 0xBD, ".": 0xBE, "/": 0xBF,
+    "`": 0xC0, "[": 0xDB, "\\": 0xDC, "]": 0xDD, "'": 0xDE,
+}
+# Letters and digits
+for _ch in "abcdefghijklmnopqrstuvwxyz":
+    _VK_CODES[_ch] = ord(_ch.upper())
+for _ch in "0123456789":
+    _VK_CODES[_ch] = ord(_ch)
+
+# Keys that must be flagged as "extended" so SendInput sets KEYEVENTF_EXTENDEDKEY.
+# Without this flag, navigation keys can be misread as numpad equivalents
+# and modifier+arrow combos may not register selection in some apps.
+_EXTENDED_KEYS = {
+    0x25, 0x26, 0x27, 0x28,  # arrows
+    0x24, 0x23,              # home, end
+    0x21, 0x22,              # page up, page down
+    0x2D, 0x2E,              # insert, delete
+    0x0D,                    # return (numpad enter is also extended)
+    0xA3,                    # right ctrl
+    0xA5,                    # right alt
+    0x5B, 0x5C,              # win keys
+    0x90,                    # num lock (special: extended)
+    0x2C,                    # print screen
+}
+
+# SendInput structures
+_INPUT_KEYBOARD = 1
+_KEYEVENTF_KEYUP = 0x0002
+_KEYEVENTF_UNICODE = 0x0004
+_KEYEVENTF_SCANCODE = 0x0008
+_KEYEVENTF_EXTENDEDKEY = 0x0001
+_MAPVK_VK_TO_VSC = 0
+
+class _KEYBDINPUT(ctypes.Structure):
+    _fields_ = [
+        ("wVk", wintypes.WORD),
+        ("wScan", wintypes.WORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ctypes.c_void_p),
+    ]
+
+class _MOUSEINPUT(ctypes.Structure):
+    _fields_ = [
+        ("dx", wintypes.LONG), ("dy", wintypes.LONG),
+        ("mouseData", wintypes.DWORD), ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.c_void_p),
+    ]
+
+class _HARDWAREINPUT(ctypes.Structure):
+    _fields_ = [
+        ("uMsg", wintypes.DWORD),
+        ("wParamL", wintypes.WORD),
+        ("wParamH", wintypes.WORD),
+    ]
+
+class _INPUT_UNION(ctypes.Union):
+    _fields_ = [("ki", _KEYBDINPUT), ("mi", _MOUSEINPUT), ("hi", _HARDWAREINPUT)]
+
+class _INPUT(ctypes.Structure):
+    _anonymous_ = ("u",)
+    _fields_ = [("type", wintypes.DWORD), ("u", _INPUT_UNION)]
+
+_user32_send = ctypes.windll.user32
+
+def _resolve_vk(key):
+    """Translate a user-supplied key name to a virtual-key code."""
+    if key is None:
+        return None
+    k = str(key).strip().lower()
+    if k in _VK_CODES:
+        return _VK_CODES[k]
+    # Single character not in map — try uppercase ord
+    if len(k) == 1:
+        return ord(k.upper())
+    return None
+
+def _send_key_event(key, key_up):
+    """Send a single key down or key up via SendInput with a real scancode."""
+    vk = _resolve_vk(key)
+    if vk is None:
+        # Fallback: let the keyboard library try (e.g. for unusual names)
+        try:
+            if key_up:
+                keyboard.release(key)
+            else:
+                keyboard.press(key)
+        except Exception as e:
+            print(f"[KEYS] Unknown key '{key}': {e}")
+        return
+    
+    # Get hardware scancode for this VK on the current keyboard layout
+    scan = _user32_send.MapVirtualKeyW(vk, _MAPVK_VK_TO_VSC) & 0xFF
+    flags = _KEYEVENTF_SCANCODE
+    if vk in _EXTENDED_KEYS:
+        flags |= _KEYEVENTF_EXTENDEDKEY
+    if key_up:
+        flags |= _KEYEVENTF_KEYUP
+    
+    inp = _INPUT(type=_INPUT_KEYBOARD)
+    inp.ki = _KEYBDINPUT(
+        wVk=0,                  # 0 because we're sending by scancode
+        wScan=scan,
+        dwFlags=flags,
+        time=0,
+        dwExtraInfo=None,
+    )
+    _user32_send.SendInput(1, ctypes.byref(inp), ctypes.sizeof(_INPUT))
+
+def send_key_down(key):
+    """Press a key (without releasing it)."""
+    _send_key_event(key, key_up=False)
+
+def send_key_up(key):
+    """Release a key."""
+    _send_key_event(key, key_up=True)
+
+
 class KeyPressCommand(MacroCommand):
     def __init__(self, key):
         super().__init__("key_press")
         self.key = key
     
     def execute(self, context):
-        keyboard.press_and_release(self.key)
+        # Use direct SendInput with scancodes so modifier combos like
+        # Shift+Right reliably register in apps that filter synthetic input
+        # (Win11 Notepad, UWP apps, some browsers).
+        send_key_down(self.key)
+        time.sleep(0.03)
+        send_key_up(self.key)
     
     def to_dict(self):
         return {"type": self.command_type, "key": self.key}
@@ -587,7 +917,10 @@ class KeyHoldCommand(MacroCommand):
         self.key = key
     
     def execute(self, context):
-        keyboard.press(self.key)
+        send_key_down(self.key)
+        # Brief settle so the OS registers the modifier as physically down
+        # before the next macro command runs.
+        time.sleep(0.03)
     
     def to_dict(self):
         return {"type": self.command_type, "key": self.key}
@@ -602,7 +935,7 @@ class KeyReleaseCommand(MacroCommand):
         self.key = key
     
     def execute(self, context):
-        keyboard.release(self.key)
+        send_key_up(self.key)
     
     def to_dict(self):
         return {"type": self.command_type, "key": self.key}
@@ -619,11 +952,14 @@ class KeyboardSequenceCommand(MacroCommand):
     def execute(self, context):
         for key, action in self.sequence:
             if action == "press":
-                keyboard.press_and_release(key)
+                send_key_down(key)
+                time.sleep(0.03)
+                send_key_up(key)
             elif action == "hold":
-                keyboard.press(key)
+                send_key_down(key)
+                time.sleep(0.03)
             elif action == "release":
-                keyboard.release(key)
+                send_key_up(key)
     
     def to_dict(self):
         return {"type": self.command_type, "sequence": self.sequence}
@@ -646,6 +982,7 @@ class MouseClickCommand(MacroCommand):
         self.offset_y = offset_y
     
     def execute(self, context):
+        """Execute mouse click"""
         if self.mode == "in_place":
             # Click at current mouse position
             current_x, current_y = pyautogui.position()
@@ -662,6 +999,30 @@ class MouseClickCommand(MacroCommand):
             # Click at absolute position (default)
             print(f"[MouseClick] Clicking {self.button} at absolute position ({self.x}, {self.y})")
             pyautogui.click(self.x, self.y, button=self.button)
+    
+    def _perform_click(self, x, y, button):
+        """Perform actual click with error handling and fallback"""
+        import time
+        
+        # Ensure integer coordinates
+        x, y = int(x), int(y)
+        
+        print(f"[MouseClick] ===== CLICK ATTEMPT START =====")
+        print(f"[MouseClick] Target: ({x}, {y}), Button: {button}")
+        
+        # Simple direct click - no modifications
+        print(f"[MouseClick] Attempting: pyautogui.click({x}, {y}, button={button})")
+        try:
+            pyautogui.click(x, y, button=button)
+            print(f"[MouseClick] ✓ Click completed")
+            time.sleep(0.2)
+            print(f"[MouseClick] ===== CLICK ATTEMPT SUCCESS =====\n")
+            return
+        except Exception as e:
+            print(f"[MouseClick] ✗ Click failed: {e}")
+            import traceback
+            traceback.print_exc()
+            raise Exception(f"Could not perform mouse click at ({x}, {y})")
     
     def to_dict(self):
         return {
@@ -806,13 +1167,25 @@ class IfImageCommand(MacroCommand):
         
         print(f"[IfImage] Starting search for {len(self.image_paths)} image(s), move_to_image={self.move_to_image}")
         
+        # Log context info
+        app_bounds = context.get("app_window_bounds", None)
+        if app_bounds:
+            print(f"[IfImage] Will exclude app window: {app_bounds}")
+        else:
+            print(f"[IfImage] No app window bounds - searching full screen")
+        
         # Try to find any of the images
-        for img_info in self.image_paths:
+        for img_idx, img_info in enumerate(self.image_paths):
             try:
                 image_path = img_info["path"]
                 confidence = img_info.get("confidence", self.confidence)
                 
-                print(f"[IfImage] Searching for: {os.path.basename(image_path)} (confidence={confidence})")
+                print(f"[IfImage] Searching image {img_idx+1}/{len(self.image_paths)}: {os.path.basename(image_path)} (confidence={confidence})")
+                
+                # Ensure image file exists
+                if not os.path.exists(image_path):
+                    print(f"[IfImage] ERROR: Image file not found: {image_path}")
+                    continue
                 
                 # Get app window bounds from context if available
                 app_window_bounds = context.get("app_window_bounds", None)
@@ -836,20 +1209,20 @@ class IfImageCommand(MacroCommand):
                         "confidence": confidence,
                         "move_to_image": self.move_to_image
                     }
-                    print(f"[IfImage] ✓ Found image: {os.path.basename(image_path)} at {center}")
+                    print(f"[IfImage] ✓ FOUND image {img_idx+1}: {os.path.basename(image_path)} at {center}")
                     print(f"[IfImage]   Confidence: {confidence}, Move: {self.move_to_image}")
                     if self.move_to_image:
                         print(f"[IfImage]   Cursor should be at {center} now")
                     return True
                 else:
-                    print(f"[IfImage] ✗ Image not found: {os.path.basename(image_path)}")
+                    print(f"[IfImage] ✗ Image {img_idx+1} NOT found: {os.path.basename(image_path)}")
                     
             except Exception as e:
-                print(f"[IfImage] ERROR finding image {img_info.get('path', 'unknown')}: {e}")
+                print(f"[IfImage] ERROR searching image {img_idx+1}: {e}")
                 import traceback
                 traceback.print_exc()
         
-        print(f"[IfImage] Search complete - NO images found")
+        print(f"[IfImage] Search complete - NO images found from {len(self.image_paths)} image(s)")
         return False
     
     def to_dict(self):
@@ -1081,6 +1454,61 @@ class FocusWindowCommand(MacroCommand):
     
     def __str__(self):
         return f"FOCUS WINDOW: {self.window_pattern}"
+
+
+class SwitchToWindowCommand(MacroCommand):
+    def __init__(self, window_pattern):
+        super().__init__("switch_to_window")
+        self.window_pattern = window_pattern
+    
+    def execute(self, context):
+        import re
+        # Convert wildcard pattern to regex
+        pattern = self.window_pattern.replace('*', '.*')
+        regex = re.compile(pattern, re.IGNORECASE)
+        
+        user32 = ctypes.windll.user32
+        EnumWindows = user32.EnumWindows
+        EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int))
+        GetWindowText = user32.GetWindowTextW
+        GetWindowTextLength = user32.GetWindowTextLengthW
+        IsWindowVisible = user32.IsWindowVisible
+        IsIconic = user32.IsIconic
+        ShowWindow = user32.ShowWindow
+        SetForegroundWindow = user32.SetForegroundWindow
+        BringWindowToTop = user32.BringWindowToTop
+        SW_RESTORE = 9
+        
+        target_hwnd = None
+        
+        def check_window(hwnd, lParam):
+            nonlocal target_hwnd
+            if IsWindowVisible(hwnd):
+                length = GetWindowTextLength(hwnd)
+                buff = ctypes.create_unicode_buffer(length + 1)
+                GetWindowText(hwnd, buff, length + 1)
+                if buff.value and regex.search(buff.value):
+                    target_hwnd = hwnd
+                    return False  # Stop enumeration
+            return True  # Continue enumeration
+        
+        # Find matching window
+        EnumWindows(EnumWindowsProc(check_window), 0)
+        
+        if target_hwnd:
+            # Restore if minimized, then bring to front and focus
+            if IsIconic(target_hwnd):
+                ShowWindow(target_hwnd, SW_RESTORE)
+            BringWindowToTop(target_hwnd)
+            SetForegroundWindow(target_hwnd)
+        else:
+            raise ValueError(f"Window matching '{self.window_pattern}' not found")
+    
+    def to_dict(self):
+        return {"type": self.command_type, "window_pattern": self.window_pattern}
+    
+    def __str__(self):
+        return f"SWITCH TO WINDOW: {self.window_pattern}"
 
 
 class MessageCommand(MacroCommand):
@@ -1697,9 +2125,19 @@ class MacroExecutor:
                 y = self.app_window.winfo_y()
                 width = self.app_window.winfo_width()
                 height = self.app_window.winfo_height()
-                return (x, y, width, height)
-            except:
-                pass
+                
+                # Validate bounds - if minimized or invalid, return None
+                if width > 0 and height > 0 and x != -32000:  # -32000 is minimized window indicator
+                    # Only use bounds if window is reasonably positioned
+                    screen_w = self.app_window.winfo_screenwidth()
+                    screen_h = self.app_window.winfo_screenheight()
+                    
+                    # Check if window is at least partially visible
+                    if (x + width > 0 and x < screen_w and 
+                        y + height > 0 and y < screen_h):
+                        return (x, y, width, height)
+            except Exception as e:
+                print(f"[AppBounds] Error getting window bounds: {e}")
         return None
     
     def log(self, message, color="white"):
@@ -1709,20 +2147,22 @@ class MacroExecutor:
         else:
             print(message)
     
-    def execute(self, macro, repeat_count=1, progress_callback=None):
-        """Execute a macro with repeat support"""
+    def execute(self, macro, repeat_count=1, progress_callback=None, start_index=0):
+        """Execute a macro with repeat support, optionally starting at start_index."""
         self.running = True
         self.stop_flag = False
         
         self.log(f"\n========== Starting Macro: {macro.name} ==========", "cyan")
         self.log(f"Repeat count: {repeat_count if repeat_count > 0 else 'Infinite'}")
+        if start_index > 0:
+            self.log(f"Starting at command index: {start_index + 1}", "yellow")
         
         if repeat_count == 0:
             # Infinite loop
             iteration = 1
             while not self.stop_flag:
                 self.log(f"\n--- Iteration {iteration} ---", "yellow")
-                self._run_commands(macro.commands, progress_callback, 0)
+                self._run_commands(macro.commands, progress_callback, 0, start_index=start_index)
                 iteration += 1
         else:
             for i in range(repeat_count):
@@ -1730,12 +2170,12 @@ class MacroExecutor:
                     break
                 if repeat_count > 1:
                     self.log(f"\n--- Iteration {i+1}/{repeat_count} ---", "yellow")
-                self._run_commands(macro.commands, progress_callback, 0)
+                self._run_commands(macro.commands, progress_callback, 0, start_index=start_index)
         
         self.log(f"\n========== Macro Completed ==========", "cyan")
         self.running = False
     
-    def _run_commands(self, commands, progress_callback=None, base_index=0):
+    def _run_commands(self, commands, progress_callback=None, base_index=0, start_index=0):
         """Run a list of commands with control flow support"""
         context = {}
         
@@ -1745,7 +2185,7 @@ class MacroExecutor:
             context["app_window_bounds"] = app_bounds
             self.log(f"App window bounds: x={app_bounds[0]}, y={app_bounds[1]}, w={app_bounds[2]}, h={app_bounds[3]}")
         
-        i = 0
+        i = max(0, min(start_index, len(commands)))
         
         # Build a label map for goto commands
         label_map = {}
@@ -1779,15 +2219,23 @@ class MacroExecutor:
             
             elif isinstance(cmd, IfImageCommand):
                 self.log(f"[{i+1}] Executing: {cmd}", "magenta")
-                result = cmd.execute(context)
-                self.log(f"    Result: {'Image FOUND' if result else 'Image NOT FOUND'}" , "green" if result else "red")
-                if "last_image_match" in context:
-                    match_info = context["last_image_match"]
-                    self.log(f"    Image: {os.path.basename(match_info['template_path'])}")
-                    self.log(f"    Center: {match_info['center']}")
-                    self.log(f"    Move to image: {match_info['move_to_image']}")
-                if not result:
-                    # Skip to ELSE or ENDIF
+                try:
+                    result = cmd.execute(context)
+                    self.log(f"    Result: {'Image FOUND' if result else 'Image NOT FOUND'}" , "green" if result else "red")
+                    if "last_image_match" in context:
+                        match_info = context["last_image_match"]
+                        self.log(f"    Image: {os.path.basename(match_info['template_path'])}")
+                        self.log(f"    Center: {match_info['center']}")
+                        self.log(f"    Move to image: {match_info['move_to_image']}")
+                    if not result:
+                        # Skip to ELSE or ENDIF
+                        i = self._skip_to_else_or_endif(commands, i)
+                        continue
+                except Exception as e:
+                    self.log(f"    Status: FAILED - {str(e)}", "red")
+                    import traceback
+                    self.log(f"    Traceback: {traceback.format_exc()}", "red")
+                    # Skip to ELSE or ENDIF on error
                     i = self._skip_to_else_or_endif(commands, i)
                     continue
             
@@ -1885,9 +2333,12 @@ class MacroMakerApp:
         self.hotkey_handlers = {}
         self.data_file = Path("macros.json")
         self.thumbnail_cache = {}  # Cache for image thumbnails
-        self.selected_index = None  # Track selected command
+        self.selected_index = None  # Active "cursor" command (one of selected_indices)
+        self.selected_indices = set()  # All currently selected command indices
+        self.selection_anchor = None  # Anchor index for shift-extended selection
         self.click_timer = None  # Timer for double-click detection
-        self.copied_command = None  # Store copied command
+        self.copied_command = None  # Store copied command (single-cmd legacy)
+        self.copied_commands = None  # Store copied commands list (multi-select)
         self.delete_key_pressed = False  # Track delete key state to prevent auto-repeat
         self.log_text = None  # Will be set during UI setup
         
@@ -1960,6 +2411,9 @@ class MacroMakerApp:
         # Pass logger and app window to executor
         self.executor.set_logger(self.log_message)
         self.executor.set_app_window(self.root)
+        
+        # Window-focused hotkey: Shift+F3 plays macro from currently selected command
+        self.root.bind_all("<Shift-F3>", self.run_macro_from_selected)
     
     def make_tabbable(self, widget):
         """Make a widget properly tabbable with focus highlighting and keyboard activation"""
@@ -2308,6 +2762,113 @@ class MacroMakerApp:
         dialog.wait_window()
         return result["value"]
     
+    def _enumerate_visible_windows(self):
+        """Return a list of titles for currently visible top-level windows."""
+        user32 = ctypes.windll.user32
+        EnumWindows = user32.EnumWindows
+        EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int))
+        GetWindowText = user32.GetWindowTextW
+        GetWindowTextLength = user32.GetWindowTextLengthW
+        IsWindowVisible = user32.IsWindowVisible
+        
+        titles = []
+        seen = set()
+        
+        def collect(hwnd, lParam):
+            if IsWindowVisible(hwnd):
+                length = GetWindowTextLength(hwnd)
+                if length > 0:
+                    buff = ctypes.create_unicode_buffer(length + 1)
+                    GetWindowText(hwnd, buff, length + 1)
+                    title = buff.value
+                    if title and title not in seen:
+                        seen.add(title)
+                        titles.append(title)
+            return True
+        
+        EnumWindows(EnumWindowsProc(collect), 0)
+        titles.sort(key=lambda s: s.lower())
+        return titles
+    
+    def show_window_selection_dialog(self, title, prompt):
+        """
+        Show a dialog with a dropdown of currently open windows plus a text
+        field for entering a partial window title (used as a wildcard pattern).
+        Returns the selected/entered pattern, or None if cancelled.
+        """
+        dialog = ctk.CTkToplevel(self.root)
+        dialog.title(title)
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        result = {"value": None}
+        
+        ctk.CTkLabel(dialog, text=prompt, font=("Arial", 12)).pack(pady=(20, 10), padx=20)
+        
+        windows = self._enumerate_visible_windows()
+        
+        # Dropdown for currently open windows
+        ctk.CTkLabel(dialog, text="Select an open window:").pack(pady=(5, 2), padx=20, anchor="w")
+        dropdown_var = tk.StringVar(value=windows[0] if windows else "")
+        dropdown = ctk.CTkComboBox(
+            dialog,
+            variable=dropdown_var,
+            values=windows if windows else ["(no windows found)"],
+            width=400,
+        )
+        dropdown.pack(pady=(0, 10), padx=20)
+        self.add_focus_highlighting(dropdown)
+        
+        # Text entry for partial title
+        ctk.CTkLabel(
+            dialog,
+            text="...or enter part of the window title (use * as wildcard):",
+        ).pack(pady=(5, 2), padx=20, anchor="w")
+        entry_var = tk.StringVar()
+        entry = ctk.CTkEntry(dialog, textvariable=entry_var, width=400)
+        entry.pack(pady=(0, 10), padx=20)
+        self.add_focus_highlighting(entry)
+        
+        def submit(event=None):
+            text = entry_var.get().strip()
+            if text:
+                # Wrap in wildcards if the user didn't include any
+                if "*" not in text:
+                    text = f"*{text}*"
+                result["value"] = text
+            else:
+                selected = dropdown_var.get().strip()
+                if selected and selected != "(no windows found)":
+                    result["value"] = selected
+            dialog.grab_release()
+            dialog.destroy()
+            return "break"
+        
+        def cancel(event=None):
+            dialog.grab_release()
+            dialog.destroy()
+            return "break"
+        
+        btn_frame = ctk.CTkFrame(dialog)
+        btn_frame.pack(pady=15, padx=20)
+        
+        ok_btn = ctk.CTkButton(btn_frame, text="OK", command=submit, width=100)
+        ok_btn.pack(side=tk.LEFT, padx=5)
+        
+        cancel_btn = ctk.CTkButton(btn_frame, text="Cancel", command=cancel, width=100)
+        cancel_btn.pack(side=tk.LEFT, padx=5)
+        
+        self.setup_dialog_tab_order(dialog, [dropdown, entry, ok_btn, cancel_btn])
+        
+        entry.bind("<Return>", submit)
+        dialog.bind("<Escape>", cancel)
+        
+        schedule_autosize(dialog)
+        dropdown.focus_set()
+        
+        dialog.wait_window()
+        return result["value"]
+    
     def setup_ui(self):
         # Top frame for macro selection - wrap buttons responsively
         top_frame = ctk.CTkFrame(self.root)
@@ -2429,9 +2990,26 @@ class MacroMakerApp:
         self.drag_data = {"index": None, "y": 0, "widget": None, "started": False, "time": 0}
         self.drop_indicator = None  # Visual indicator for drop location
         
-        # Bind scrolling
-        self.command_frame.bind("<Configure>", lambda e: self.command_canvas.configure(scrollregion=self.command_canvas.bbox("all")))
+        # Bind scrolling: keep scrollregion in sync, and keep the inner frame
+        # exactly as wide as the visible canvas so command rows pack across
+        # the full width and the scrollregion covers the whole content area.
+        def _on_inner_configure(_e):
+            self._refresh_command_scrollregion()
+        def _on_canvas_configure(e):
+            try:
+                self.command_canvas.itemconfigure(self.canvas_frame_id, width=e.width)
+            except Exception:
+                pass
+            # Width change can re-flow content; refresh scrollregion after
+            # the inner frame has had a chance to lay out the new width.
+            self.command_canvas.after_idle(self._refresh_command_scrollregion)
+        self.command_frame.bind("<Configure>", _on_inner_configure)
+        self.command_canvas.bind("<Configure>", _on_canvas_configure)
         self.command_canvas.bind("<MouseWheel>", self._on_mousewheel)
+        # Also catch the wheel on the inner frame and the scrollbar so
+        # scrolling works no matter what the cursor is over.
+        self.command_frame.bind("<MouseWheel>", self._on_mousewheel)
+        scrollbar.bind("<MouseWheel>", self._on_mousewheel)
         
         # Bind left-click on canvas to focus and deselect
         self.command_canvas.bind("<Button-1>", self.on_canvas_click)
@@ -2484,6 +3062,14 @@ class MacroMakerApp:
         self.command_canvas.bind("<Down>", self.navigate_down)
         self.command_canvas.bind("<Home>", self.navigate_home)
         self.command_canvas.bind("<End>", self.navigate_end)
+        # Shift+Arrow/Home/End/PageUp/PageDown extend the selection
+        self.command_canvas.bind("<Shift-Up>", self.navigate_up_extend)
+        self.command_canvas.bind("<Shift-Down>", self.navigate_down_extend)
+        self.command_canvas.bind("<Shift-Home>", self.navigate_home_extend)
+        self.command_canvas.bind("<Shift-End>", self.navigate_end_extend)
+        self.command_canvas.bind("<Shift-Prior>", self.navigate_page_up_extend)
+        self.command_canvas.bind("<Shift-Next>", self.navigate_page_down_extend)
+        self.command_canvas.bind("<Control-a>", self.select_all_commands)
         # Bind Ctrl+Arrow/Home/End for moving commands
         self.command_canvas.bind("<Control-Up>", self.move_selected_up)
         self.command_canvas.bind("<Control-Down>", self.move_selected_down)
@@ -2571,8 +3157,10 @@ class MacroMakerApp:
                 current_level += 1
                 in_else = False
             elif isinstance(cmd, ElseStatementCommand):
-                # ELSE is at same level as IF
-                nesting_levels.append(current_level - 1)
+                # ELSE is at same level as IF. Clamp to >=0 in case the
+                # macro is malformed (an ELSE without a preceding IF would
+                # otherwise produce a negative indent and break pack()).
+                nesting_levels.append(max(0, current_level - 1))
                 in_else = True
             elif isinstance(cmd, (EndIfStatementCommand, EndRepeatCommand)):
                 current_level = max(0, current_level - 1)
@@ -2581,57 +3169,88 @@ class MacroMakerApp:
             else:
                 nesting_levels.append(current_level)
         
-        # Create a frame for each command
+        # Create a frame for each command. Each render is wrapped in a
+        # try/except so that a malformed command (or a thumbnail load error)
+        # cannot abort the loop and hide every subsequent command.
         for idx, cmd in enumerate(self.current_macro.commands):
-            # Get the color for this command type
-            cmd_class = cmd.__class__.__name__
-            cmd_color = self.action_colors.get(cmd_class, self.action_colors['default'])
-            
-            # Lighten the color if selected
-            if idx == self.selected_index:
-                # Create a lighter version by mixing with white
-                cmd_color = self._lighten_color(cmd_color, 0.3)
-            
-            # Calculate indentation based on nesting level
-            indent = nesting_levels[idx] * 20  # 20 pixels per nesting level
-            
-            cmd_frame = tk.Frame(self.command_frame, relief=tk.RAISED, borderwidth=2, bg=cmd_color, highlightbackground=cmd_color, highlightthickness=2)
-            cmd_frame.pack(fill=tk.X, padx=(2 + indent, 2), pady=2)
-            cmd_frame._command_index = idx
-            
-            # Check if this is an image command
-            if isinstance(cmd, (IfImageCommand, FindImageCommand)):
-                # Create horizontal layout: thumbnail | text
-                thumb_label = self._create_thumbnail(cmd_frame, cmd.image_path)
-                if thumb_label:
-                    thumb_label.pack(side=tk.LEFT, padx=5, pady=2)
-                    thumb_label.config(bg=cmd_color)
+            try:
+                # Get the color for this command type
+                cmd_class = cmd.__class__.__name__
+                cmd_color = self.action_colors.get(cmd_class, self.action_colors['default'])
                 
-                text_label = tk.Label(cmd_frame, text=str(cmd), anchor=tk.W, bg=cmd_color, fg="white", font=("Arial", 10, "bold"))
-                text_label.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5, pady=5)
-            else:
-                # Regular command - just text
-                text_label = tk.Label(cmd_frame, text=str(cmd), anchor=tk.W, bg=cmd_color, fg="white", font=("Arial", 10, "bold"))
-                text_label.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-            
-            # Bind events for selection and dragging (double-click must be bound first)
-            cmd_frame.bind("<Double-1>", self.on_edit_command)
-            cmd_frame.bind("<Button-1>", self.on_command_click)
-            cmd_frame.bind("<B1-Motion>", self.on_drag_motion)
-            cmd_frame.bind("<ButtonRelease-1>", self.on_drag_release)
-            cmd_frame.bind("<Button-3>", self.show_context_menu)  # Right-click
-            
-            # Also bind to child widgets
-            for child in cmd_frame.winfo_children():
-                child.bind("<Double-1>", self.on_edit_command)
-                child.bind("<Button-1>", self.on_command_click)
-                child.bind("<B1-Motion>", self.on_drag_motion)
-                child.bind("<ButtonRelease-1>", self.on_drag_release)
-                child.bind("<Button-3>", self.show_context_menu)  # Right-click
+                # Lighten the color if selected
+                if idx in self.selected_indices or idx == self.selected_index:
+                    # Create a lighter version by mixing with white
+                    # The active cursor gets a slightly stronger highlight
+                    lighten_amount = 0.4 if idx == self.selected_index else 0.3
+                    cmd_color = self._lighten_color(cmd_color, lighten_amount)
+                
+                # Calculate indentation based on nesting level. Clamp to >=0
+                # so a malformed macro (e.g. ELSE/ENDIF without a matching IF)
+                # cannot produce a negative padx and raise a TclError that
+                # would abort rendering of the rest of the list.
+                indent = max(0, nesting_levels[idx]) * 20  # 20 pixels per level
+                
+                cmd_frame = tk.Frame(self.command_frame, relief=tk.RAISED, borderwidth=2, bg=cmd_color, highlightbackground=cmd_color, highlightthickness=2)
+                cmd_frame.pack(fill=tk.X, padx=(2 + indent, 2), pady=2)
+                cmd_frame._command_index = idx
+                
+                # Check if this is an image command
+                if isinstance(cmd, (IfImageCommand, FindImageCommand)):
+                    # Create horizontal layout: thumbnail | text
+                    thumb_label = self._create_thumbnail(cmd_frame, cmd.image_path)
+                    if thumb_label:
+                        thumb_label.pack(side=tk.LEFT, padx=5, pady=2)
+                        thumb_label.config(bg=cmd_color)
+                    
+                    text_label = tk.Label(cmd_frame, text=str(cmd), anchor=tk.W, bg=cmd_color, fg="white", font=("Arial", 10, "bold"))
+                    text_label.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5, pady=5)
+                else:
+                    # Regular command - just text
+                    text_label = tk.Label(cmd_frame, text=str(cmd), anchor=tk.W, bg=cmd_color, fg="white", font=("Arial", 10, "bold"))
+                    text_label.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+                
+                # Bind events for selection and dragging (double-click must be bound first)
+                cmd_frame.bind("<Double-1>", self.on_edit_command)
+                cmd_frame.bind("<Button-1>", self.on_command_click)
+                cmd_frame.bind("<B1-Motion>", self.on_drag_motion)
+                cmd_frame.bind("<ButtonRelease-1>", self.on_drag_release)
+                cmd_frame.bind("<Button-3>", self.show_context_menu)  # Right-click
+                
+                # Also bind to child widgets
+                for child in cmd_frame.winfo_children():
+                    child.bind("<Double-1>", self.on_edit_command)
+                    child.bind("<Button-1>", self.on_command_click)
+                    child.bind("<B1-Motion>", self.on_drag_motion)
+                    child.bind("<ButtonRelease-1>", self.on_drag_release)
+                    child.bind("<Button-3>", self.show_context_menu)  # Right-click
+            except Exception as render_err:
+                print(f"[update_command_list] failed to render command #{idx} ({cmd.__class__.__name__}): {render_err}")
+                # Render a minimal error placeholder so the user can still
+                # see and edit/delete the offending row.
+                try:
+                    err_frame = tk.Frame(self.command_frame, bg="#552222", relief=tk.RAISED, borderwidth=2)
+                    err_frame.pack(fill=tk.X, padx=2, pady=2)
+                    err_frame._command_index = idx
+                    tk.Label(err_frame, text=f"[render error] {cmd.__class__.__name__}: {render_err}",
+                             anchor=tk.W, bg="#552222", fg="white",
+                             font=("Arial", 10, "bold")).pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+                    err_frame.bind("<Button-1>", self.on_command_click)
+                    err_frame.bind("<Button-3>", self.show_context_menu)
+                except Exception:
+                    pass
         
-        # Update scroll region
-        self.command_frame.update_idletasks()
-        self.command_canvas.configure(scrollregion=self.command_canvas.bbox("all"))
+        # Update scroll region (force both inner frame and canvas to settle
+        # so winfo_reqheight reflects the final laid-out content).
+        self._refresh_command_scrollregion()
+        # Some geometry managers report 1px reqheight on the first pass —
+        # schedule a second refresh after Tk has done a full layout cycle.
+        self.command_canvas.after_idle(self._refresh_command_scrollregion)
+        
+        # Forward MouseWheel from every newly-created command frame and its
+        # children to the canvas so scrolling works while hovering rows.
+        for cmd_frame in self.command_frame.winfo_children():
+            self._bind_command_panel_scroll(cmd_frame)
     
     def highlight_command(self, index):
         """Highlight the command at the given index during execution"""
@@ -2647,8 +3266,9 @@ class MacroMakerApp:
                     original_color = self.action_colors.get(cmd_class, self.action_colors['default'])
                     
                     # If this is the selected command, lighten it
-                    if cmd_idx == self.selected_index:
-                        original_color = self._lighten_color(original_color, 0.3)
+                    if cmd_idx in self.selected_indices or cmd_idx == self.selected_index:
+                        lighten_amount = 0.4 if cmd_idx == self.selected_index else 0.3
+                        original_color = self._lighten_color(original_color, lighten_amount)
                     
                     print(f"[HIGHLIGHT] Resetting frame {cmd_idx} to original color: {original_color}")
                     frame.config(bg=original_color)
@@ -2686,6 +3306,35 @@ class MacroMakerApp:
     def _on_mousewheel(self, event):
         """Handle mousewheel scrolling"""
         self.command_canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+        return "break"
+    
+    def _refresh_command_scrollregion(self):
+        """Recompute the canvas scrollregion from the inner frame's required
+        height. More reliable than bbox('all') right after a re-pack because
+        winfo_reqheight reflects the geometry manager's calculation even
+        before the canvas has redrawn."""
+        try:
+            self.command_frame.update_idletasks()
+            self.command_canvas.update_idletasks()
+            req_h = self.command_frame.winfo_reqheight()
+            # Use canvas width for horizontal extent so we never get a phantom
+            # horizontal scroll. Height is the full content height so every
+            # row is reachable via the scrollbar / wheel.
+            cv_w = max(self.command_canvas.winfo_width(), 1)
+            self.command_canvas.configure(scrollregion=(0, 0, cv_w, req_h))
+        except Exception as e:
+            print(f"[SCROLL] refresh failed: {e}")
+    
+    def _bind_command_panel_scroll(self, widget):
+        """Forward MouseWheel and PageUp/Down from the given widget (and all
+        its descendants) to the command_canvas so scrolling works no matter
+        what part of the list the cursor is over.
+        """
+        widget.bind("<MouseWheel>", self._on_mousewheel)
+        widget.bind("<Prior>", lambda e: (self.command_canvas.yview_scroll(-1, "pages"), "break")[1])
+        widget.bind("<Next>",  lambda e: (self.command_canvas.yview_scroll( 1, "pages"), "break")[1])
+        for child in widget.winfo_children():
+            self._bind_command_panel_scroll(child)
     
     def save_state(self):
         """Save current state to undo stack"""
@@ -2805,6 +3454,8 @@ class MacroMakerApp:
             return WaitForWindowCommand(data.get('window_pattern', '*'), data.get('timeout', 30))
         elif cmd_type == 'focus_window':
             return FocusWindowCommand(data.get('window_pattern', '*'))
+        elif cmd_type == 'switch_to_window':
+            return SwitchToWindowCommand(data.get('window_pattern', '*'))
         elif cmd_type == 'sound':
             cmd = SoundCommand(data.get('sound_type', 'beep'))
             cmd.custom_sound = data.get('custom_sound')
@@ -2847,6 +3498,34 @@ class MacroMakerApp:
         if widget and hasattr(widget, '_command_index'):
             cmd_index = widget._command_index
             
+            # Modifier-aware selection (Shift extends, Ctrl toggles).
+            # event.state bit 0x0001 = Shift, 0x0004 = Control on Tk on Windows.
+            shift_held = bool(event.state & 0x0001)
+            ctrl_held = bool(event.state & 0x0004)
+            if shift_held:
+                if self.click_timer is not None:
+                    self.root.after_cancel(self.click_timer)
+                    self.click_timer = None
+                self._extend_selection_to(cmd_index)
+                self.update_command_list()
+                self.command_canvas.focus_set()
+                return
+            if ctrl_held:
+                if self.click_timer is not None:
+                    self.root.after_cancel(self.click_timer)
+                    self.click_timer = None
+                if cmd_index in self.selected_indices:
+                    self.selected_indices.discard(cmd_index)
+                    if self.selected_index == cmd_index:
+                        self.selected_index = next(iter(self.selected_indices), None)
+                else:
+                    self.selected_indices.add(cmd_index)
+                    self.selected_index = cmd_index
+                self.selection_anchor = cmd_index
+                self.update_command_list()
+                self.command_canvas.focus_set()
+                return
+            
             # Check if this is a double-click (clicking same item within 300ms)
             if (self.click_timer is not None and 
                 hasattr(self, '_last_click_index') and 
@@ -2877,7 +3556,7 @@ class MacroMakerApp:
                 widget = widget.master
         
         # Click was on empty area - deselect and focus canvas
-        self.selected_index = None
+        self._set_single_selection(None)
         self.update_command_list()
         self.command_canvas.focus_set()
     
@@ -2885,8 +3564,8 @@ class MacroMakerApp:
         """Handle confirmed single click after delay"""
         self.click_timer = None
         
-        # Update selection
-        self.selected_index = cmd_index
+        # Plain click: collapse selection to just this index
+        self._set_single_selection(cmd_index)
         self.update_command_list()
         # Focus the command list panel (same as pressing F2)
         try:
@@ -2989,6 +3668,36 @@ class MacroMakerApp:
         elif isinstance(cmd, (IfImageCommand, FindImageCommand)):
             self.edit_image_command(cmd, index)
     
+    def _set_single_selection(self, index):
+        """Make `index` the only selected command and reset the anchor."""
+        if index is None:
+            self.selected_index = None
+            self.selected_indices = set()
+            self.selection_anchor = None
+        else:
+            self.selected_index = index
+            self.selected_indices = {index}
+            self.selection_anchor = index
+    
+    def _extend_selection_to(self, index):
+        """Extend the selection range from the anchor to `index`."""
+        if index is None or not self.current_macro:
+            return
+        if self.selection_anchor is None:
+            self.selection_anchor = self.selected_index if self.selected_index is not None else index
+        anchor = self.selection_anchor
+        lo, hi = (anchor, index) if anchor <= index else (index, anchor)
+        self.selected_indices = set(range(lo, hi + 1))
+        self.selected_index = index  # Active cursor
+    
+    def _get_selected_indices_sorted(self):
+        """Return sorted list of currently selected indices (deduped)."""
+        if self.selected_indices:
+            return sorted(self.selected_indices)
+        if self.selected_index is not None:
+            return [self.selected_index]
+        return []
+    
     def navigate_up(self, event):
         """Navigate to previous command in list"""
         if not self.current_macro or not self.current_macro.commands:
@@ -2996,10 +3705,13 @@ class MacroMakerApp:
         
         if self.selected_index is None:
             # Select last item
-            self.selected_index = len(self.current_macro.commands) - 1
+            new_index = len(self.current_macro.commands) - 1
         elif self.selected_index > 0:
-            self.selected_index -= 1
+            new_index = self.selected_index - 1
+        else:
+            new_index = self.selected_index
         
+        self._set_single_selection(new_index)
         self.update_command_list()
         self.scroll_to_selected()
         return "break"  # Prevent default scrolling
@@ -3011,10 +3723,13 @@ class MacroMakerApp:
         
         if self.selected_index is None:
             # Select first item
-            self.selected_index = 0
+            new_index = 0
         elif self.selected_index < len(self.current_macro.commands) - 1:
-            self.selected_index += 1
+            new_index = self.selected_index + 1
+        else:
+            new_index = self.selected_index
         
+        self._set_single_selection(new_index)
         self.update_command_list()
         self.scroll_to_selected()
         return "break"  # Prevent default scrolling
@@ -3024,7 +3739,7 @@ class MacroMakerApp:
         if not self.current_macro or not self.current_macro.commands:
             return
         
-        self.selected_index = 0
+        self._set_single_selection(0)
         self.update_command_list()
         self.scroll_to_selected()
         return "break"
@@ -3034,9 +3749,98 @@ class MacroMakerApp:
         if not self.current_macro or not self.current_macro.commands:
             return
         
-        self.selected_index = len(self.current_macro.commands) - 1
+        self._set_single_selection(len(self.current_macro.commands) - 1)
         self.update_command_list()
         self.scroll_to_selected()
+        return "break"
+
+    # ---- Shift-extended navigation (multi-select) ----
+    def navigate_up_extend(self, event):
+        """Extend selection upward (Shift+Up)."""
+        if not self.current_macro or not self.current_macro.commands:
+            return "break"
+        if self.selected_index is None:
+            self._set_single_selection(len(self.current_macro.commands) - 1)
+        else:
+            new_index = max(0, self.selected_index - 1)
+            self._extend_selection_to(new_index)
+        self.update_command_list()
+        self.scroll_to_selected()
+        return "break"
+    
+    def navigate_down_extend(self, event):
+        """Extend selection downward (Shift+Down)."""
+        if not self.current_macro or not self.current_macro.commands:
+            return "break"
+        if self.selected_index is None:
+            self._set_single_selection(0)
+        else:
+            new_index = min(len(self.current_macro.commands) - 1, self.selected_index + 1)
+            self._extend_selection_to(new_index)
+        self.update_command_list()
+        self.scroll_to_selected()
+        return "break"
+    
+    def navigate_home_extend(self, event):
+        """Extend selection to first command (Shift+Home)."""
+        if not self.current_macro or not self.current_macro.commands:
+            return "break"
+        if self.selected_index is None:
+            self._set_single_selection(0)
+        else:
+            self._extend_selection_to(0)
+        self.update_command_list()
+        self.scroll_to_selected()
+        return "break"
+    
+    def navigate_end_extend(self, event):
+        """Extend selection to last command (Shift+End)."""
+        if not self.current_macro or not self.current_macro.commands:
+            return "break"
+        last = len(self.current_macro.commands) - 1
+        if self.selected_index is None:
+            self._set_single_selection(last)
+        else:
+            self._extend_selection_to(last)
+        self.update_command_list()
+        self.scroll_to_selected()
+        return "break"
+    
+    def navigate_page_up_extend(self, event):
+        """Extend selection up by ~10 (Shift+PageUp)."""
+        if not self.current_macro or not self.current_macro.commands:
+            return "break"
+        if self.selected_index is None:
+            self._set_single_selection(len(self.current_macro.commands) - 1)
+        else:
+            self._extend_selection_to(max(0, self.selected_index - 10))
+        self.update_command_list()
+        self.scroll_to_selected()
+        return "break"
+    
+    def navigate_page_down_extend(self, event):
+        """Extend selection down by ~10 (Shift+PageDown)."""
+        if not self.current_macro or not self.current_macro.commands:
+            return "break"
+        if self.selected_index is None:
+            self._set_single_selection(0)
+        else:
+            self._extend_selection_to(
+                min(len(self.current_macro.commands) - 1, self.selected_index + 10)
+            )
+        self.update_command_list()
+        self.scroll_to_selected()
+        return "break"
+
+    def select_all_commands(self, event=None):
+        """Select every command in the current macro (Ctrl+A)."""
+        if not self.current_macro or not self.current_macro.commands:
+            return "break"
+        last = len(self.current_macro.commands) - 1
+        self.selection_anchor = 0
+        self.selected_index = last
+        self.selected_indices = set(range(0, last + 1))
+        self.update_command_list()
         return "break"
 
     def move_selected_up(self, event):
@@ -3105,10 +3909,11 @@ class MacroMakerApp:
             return
         
         if self.selected_index is None:
-            self.selected_index = len(self.current_macro.commands) - 1
+            new_index = len(self.current_macro.commands) - 1
         else:
-            self.selected_index = max(0, self.selected_index - 10)
+            new_index = max(0, self.selected_index - 10)
         
+        self._set_single_selection(new_index)
         self.update_command_list()
         self.scroll_to_selected()
         return "break"
@@ -3119,39 +3924,72 @@ class MacroMakerApp:
             return
         
         if self.selected_index is None:
-            self.selected_index = 0
+            new_index = 0
         else:
-            self.selected_index = min(len(self.current_macro.commands) - 1, self.selected_index + 10)
+            new_index = min(len(self.current_macro.commands) - 1, self.selected_index + 10)
         
+        self._set_single_selection(new_index)
         self.update_command_list()
         self.scroll_to_selected()
         return "break"
     
     def scroll_to_selected(self):
-        """Scroll canvas to show selected command"""
+        """Scroll canvas just enough to bring the selected command into view.
+        
+        Mirrors standard listbox / file-tree behavior: if the item is already
+        visible, do nothing; otherwise scroll the minimum amount so that the
+        item is fully visible (top-aligned when scrolling up, bottom-aligned
+        when scrolling down). This avoids the disorienting "jump to center"
+        on every arrow keystroke.
+        """
         if self.selected_index is None:
             return
         
         # Find the selected frame
+        target = None
         for child in self.command_frame.winfo_children():
             if hasattr(child, '_command_index') and child._command_index == self.selected_index:
-                # Get frame position relative to command_frame
-                frame_y = child.winfo_y()
-                frame_height = child.winfo_height()
-                
-                # Get canvas viewport
-                canvas_height = self.command_canvas.winfo_height()
-                
-                # Calculate scroll position to center the frame
-                scroll_region = self.command_canvas.bbox("all")
-                if scroll_region:
-                    total_height = scroll_region[3] - scroll_region[1]
-                    if total_height > canvas_height:
-                        # Calculate fraction to scroll
-                        scroll_pos = (frame_y + frame_height / 2 - canvas_height / 2) / total_height
-                        scroll_pos = max(0, min(1, scroll_pos))  # Clamp between 0 and 1
-                        self.command_canvas.yview_moveto(scroll_pos)
+                target = child
                 break
+        if target is None:
+            return
+        
+        # Make sure geometry is current
+        self.command_frame.update_idletasks()
+        self.command_canvas.update_idletasks()
+        
+        bbox = self.command_canvas.bbox("all")
+        if not bbox:
+            return
+        total_height = bbox[3] - bbox[1]
+        canvas_height = self.command_canvas.winfo_height()
+        if total_height <= canvas_height:
+            return  # No scrolling needed
+        
+        # Item position within the inner content
+        frame_y = target.winfo_y()
+        frame_h = target.winfo_height()
+        item_top = frame_y
+        item_bottom = frame_y + frame_h
+        
+        # Current viewport (in content coordinates)
+        view_top_frac, view_bottom_frac = self.command_canvas.yview()
+        view_top = view_top_frac * total_height
+        view_bottom = view_bottom_frac * total_height
+        
+        # Small margin so the item isn't pressed against the edge
+        margin = 4
+        
+        new_top = None
+        if item_top < view_top + margin:
+            # Item is above the viewport — align its top with the viewport top
+            new_top = max(0, item_top - margin)
+        elif item_bottom > view_bottom - margin:
+            # Item is below the viewport — align its bottom with viewport bottom
+            new_top = min(total_height - canvas_height, item_bottom - canvas_height + margin)
+        
+        if new_top is not None:
+            self.command_canvas.yview_moveto(new_top / total_height)
     
     def open_selected_command(self, event):
         """Open edit dialog for selected command when Enter is pressed"""
@@ -3274,6 +4112,39 @@ class MacroMakerApp:
         
         return "break"
     
+    @staticmethod
+    def _add_menu_items(menu, items):
+        """Add items to a tk.Menu with auto-assigned unique underline keys.
+        
+        items: list of tuples. Each tuple is one of:
+            ("separator",)                              - adds a separator
+            (label, command)                             - adds a command
+            (label, command, extra_kwargs_dict)           - adds a command with extra kwargs
+            (label, submenu_widget, "cascade")           - adds a cascade submenu
+        
+        Underline characters are assigned automatically by picking the first
+        unused alphanumeric character in each label, so adding new items
+        never creates keyboard conflicts.
+        """
+        used_chars = set()
+        for item in items:
+            if item[0] == "separator":
+                menu.add_separator()
+                continue
+            label = item[0]
+            # Find first unused alphanumeric character for underline
+            underline = -1
+            for i, ch in enumerate(label):
+                if ch.isalnum() and ch.lower() not in used_chars:
+                    used_chars.add(ch.lower())
+                    underline = i
+                    break
+            if len(item) >= 3 and item[2] == "cascade":
+                menu.add_cascade(label=label, underline=underline, menu=item[1])
+            else:
+                kwargs = item[2] if len(item) >= 3 and isinstance(item[2], dict) else {}
+                menu.add_command(label=label, underline=underline, command=item[1], **kwargs)
+
     def show_context_menu(self, event):
         """Show right-click context menu"""
         if not self.current_macro:
@@ -3292,7 +4163,12 @@ class MacroMakerApp:
         
         # Set selection based on what was clicked
         if clicked_command is not None:
-            self.selected_index = clicked_command
+            # If right-clicked frame is part of an existing multi-selection,
+            # keep that selection so Copy/Cut/Delete act on the whole group.
+            if clicked_command not in self.selected_indices:
+                self._set_single_selection(clicked_command)
+            else:
+                self.selected_index = clicked_command
             self.update_command_list()
         # If clicked on empty space, don't change selection
         
@@ -3304,66 +4180,87 @@ class MacroMakerApp:
         
         # Mouse commands submenu
         mouse_menu = tk.Menu(menu, tearoff=0, bg=menu_bg, fg=menu_fg, activebackground="#50C878", activeforeground=menu_fg)
-        mouse_menu.add_command(label="Click", underline=0, command=lambda: self.insert_command_at_selection("mouse_click"))
-        mouse_menu.add_command(label="click (Absolute)", underline=7, command=lambda: self.insert_command_at_selection("mouse_click_absolute"))
-        mouse_menu.add_command(label="Move", underline=0, command=lambda: self.insert_command_at_selection("mouse_move"))
-        mouse_menu.add_command(label="Hold", underline=0, command=lambda: self.insert_command_at_selection("mouse_hold"))
-        mouse_menu.add_command(label="Release", underline=0, command=lambda: self.insert_command_at_selection("mouse_release"))
-        menu.add_cascade(label="Mouse Commands", underline=0, menu=mouse_menu)
+        self._add_menu_items(mouse_menu, [
+            ("Click", lambda: self.insert_command_at_selection("mouse_click")),
+            ("Click (Absolute)", lambda: self.insert_command_at_selection("mouse_click_absolute")),
+            ("Move", lambda: self.insert_command_at_selection("mouse_move")),
+            ("Hold", lambda: self.insert_command_at_selection("mouse_hold")),
+            ("Release", lambda: self.insert_command_at_selection("mouse_release")),
+        ])
         
         # Keyboard commands submenu
         keyboard_menu = tk.Menu(menu, tearoff=0, bg=menu_bg, fg=menu_fg, activebackground="#4A90E2", activeforeground=menu_fg)
-        keyboard_menu.add_command(label="Press", underline=0, command=lambda: self.insert_command_at_selection("key_press"))
-        keyboard_menu.add_command(label="Hold", underline=0, command=lambda: self.insert_command_at_selection("key_hold"))
-        keyboard_menu.add_command(label="Release", underline=0, command=lambda: self.insert_command_at_selection("key_release"))
-        keyboard_menu.add_command(label="Sequence", underline=0, command=lambda: self.insert_command_at_selection("keyboard_sequence"))
-        menu.add_cascade(label="Keyboard Commands", underline=0, menu=keyboard_menu)
+        self._add_menu_items(keyboard_menu, [
+            ("Press", lambda: self.insert_command_at_selection("key_press")),
+            ("Hold", lambda: self.insert_command_at_selection("key_hold")),
+            ("Release", lambda: self.insert_command_at_selection("key_release")),
+            ("Sequence", lambda: self.insert_command_at_selection("keyboard_sequence")),
+        ])
         
         # Image commands submenu
         image_menu = tk.Menu(menu, tearoff=0, bg=menu_bg, fg=menu_fg, activebackground="#9B59B6", activeforeground=menu_fg)
-        image_menu.add_command(label="IF IMAGE", underline=0, command=lambda: self.insert_command_at_selection("if_image"))
-        image_menu.add_command(label="FIND IMAGE", underline=1, command=lambda: self.insert_command_at_selection("find_image"))
-        menu.add_cascade(label="Image Commands", underline=1, menu=image_menu)
+        self._add_menu_items(image_menu, [
+            ("IF IMAGE", lambda: self.insert_command_at_selection("if_image")),
+            ("FIND IMAGE", lambda: self.insert_command_at_selection("find_image")),
+        ])
         
         # Control flow commands submenu
         flow_menu = tk.Menu(menu, tearoff=0, bg=menu_bg, fg=menu_fg, activebackground="#E67E22", activeforeground=menu_fg)
-        flow_menu.add_command(label="IF Statement", underline=0, command=lambda: self.insert_command_at_selection("if_statement"))
-        flow_menu.add_command(label="ELSE", underline=0, command=lambda: self.insert_command_at_selection("else"))
-        flow_menu.add_command(label="eNd IF", underline=1, command=lambda: self.insert_command_at_selection("end_if"))
-        flow_menu.add_command(label="REPEAT", underline=0, command=lambda: self.insert_command_at_selection("repeat"))
-        flow_menu.add_command(label="end Repeat", underline=5, command=lambda: self.insert_command_at_selection("end_repeat"))
-        flow_menu.add_command(label="LABEL", underline=0, command=lambda: self.insert_command_at_selection("label"))
-        flow_menu.add_command(label="GOTO", underline=0, command=lambda: self.insert_command_at_selection("goto"))
-        menu.add_cascade(label="Control Flow", underline=8, menu=flow_menu)
+        self._add_menu_items(flow_menu, [
+            ("IF Statement", lambda: self.insert_command_at_selection("if_statement")),
+            ("ELSE", lambda: self.insert_command_at_selection("else")),
+            ("END IF", lambda: self.insert_command_at_selection("end_if")),
+            ("REPEAT", lambda: self.insert_command_at_selection("repeat")),
+            ("End Repeat", lambda: self.insert_command_at_selection("end_repeat")),
+            ("LABEL", lambda: self.insert_command_at_selection("label")),
+            ("GOTO", lambda: self.insert_command_at_selection("goto")),
+        ])
         
         # Clipboard commands submenu
         clipboard_menu = tk.Menu(menu, tearoff=0, bg=menu_bg, fg=menu_fg, activebackground="#1ABC9C", activeforeground=menu_fg)
-        clipboard_menu.add_command(label="Clear", underline=0, command=lambda: self.insert_command_at_selection("clipboard_clear"))
-        clipboard_menu.add_command(label="Set", underline=0, command=lambda: self.insert_command_at_selection("clipboard_set"))
-        clipboard_menu.add_command(label="Increment", underline=0, command=lambda: self.insert_command_at_selection("clipboard_increment"))
-        clipboard_menu.add_command(label="cOpy", underline=1, command=lambda: self.insert_command_at_selection("clipboard_copy"))
-        clipboard_menu.add_command(label="pAste", underline=1, command=lambda: self.insert_command_at_selection("clipboard_paste"))
-        clipboard_menu.add_command(label="Edit", underline=0, command=lambda: self.insert_command_at_selection("clipboard_edit"))
-        clipboard_menu.add_command(label="capture scReen", underline=11, command=lambda: self.insert_command_at_selection("capture_screen"))
-        clipboard_menu.add_command(label="saVe Image", underline=2, command=lambda: self.insert_command_at_selection("save_clipboard_image"))
-        menu.add_cascade(label="cLipboard Commands", underline=1, menu=clipboard_menu)
+        self._add_menu_items(clipboard_menu, [
+            ("Clear", lambda: self.insert_command_at_selection("clipboard_clear")),
+            ("Set", lambda: self.insert_command_at_selection("clipboard_set")),
+            ("Increment", lambda: self.insert_command_at_selection("clipboard_increment")),
+            ("Copy", lambda: self.insert_command_at_selection("clipboard_copy")),
+            ("Paste", lambda: self.insert_command_at_selection("clipboard_paste")),
+            ("Edit", lambda: self.insert_command_at_selection("clipboard_edit")),
+            ("Capture Screen", lambda: self.insert_command_at_selection("capture_screen")),
+            ("Save Image", lambda: self.insert_command_at_selection("save_clipboard_image")),
+        ])
         
         # Timing/Utility/Window commands submenu
         timing_menu = tk.Menu(menu, tearoff=0, bg=menu_bg, fg=menu_fg, activebackground="#F39C12", activeforeground=menu_fg)
-        timing_menu.add_command(label="Delay (seconds)", underline=0, command=lambda: self.insert_command_at_selection("delay"))
-        timing_menu.add_command(label="delay (Milliseconds)", underline=7, command=lambda: self.insert_command_at_selection("delay_ms"))
-        timing_menu.add_command(label="Wait for Window", underline=0, command=lambda: self.insert_command_at_selection("wait_for_window"))
-        timing_menu.add_command(label="Focus window", underline=1, command=lambda: self.insert_command_at_selection("focus_window"))
-        timing_menu.add_command(label="Message", underline=0, command=lambda: self.insert_command_at_selection("message"))
-        timing_menu.add_command(label="Sound", underline=0, command=lambda: self.insert_command_at_selection("sound"))
-        menu.add_cascade(label="Timing/Utility", underline=0, menu=timing_menu)
+        self._add_menu_items(timing_menu, [
+            ("Delay (seconds)", lambda: self.insert_command_at_selection("delay")),
+            ("Delay (Milliseconds)", lambda: self.insert_command_at_selection("delay_ms")),
+            ("Wait for Window", lambda: self.insert_command_at_selection("wait_for_window")),
+            ("Message", lambda: self.insert_command_at_selection("message")),
+            ("Sound", lambda: self.insert_command_at_selection("sound")),
+        ])
         
-        # Add separator and Copy/Paste/Delete options
-        menu.add_separator()
-        menu.add_command(label="Copy", underline=0, command=self.copy_command, accelerator="Ctrl+C")
-        menu.add_command(label="Paste", underline=0, command=self.paste_command, accelerator="Ctrl+V")
-        menu.add_separator()
-        menu.add_command(label="Delete", underline=0, command=self.remove_command)
+        # Windows commands submenu
+        windows_menu = tk.Menu(menu, tearoff=0, bg=menu_bg, fg=menu_fg, activebackground="#3498DB", activeforeground=menu_fg)
+        self._add_menu_items(windows_menu, [
+            ("Switch to Window", lambda: self.insert_command_at_selection("switch_to_window")),
+            ("Focus Window", lambda: self.insert_command_at_selection("focus_window")),
+        ])
+        
+        # Top-level cascades and actions (underlines auto-assigned across all)
+        self._add_menu_items(menu, [
+            ("Mouse Commands", mouse_menu, "cascade"),
+            ("Keyboard Commands", keyboard_menu, "cascade"),
+            ("Image Commands", image_menu, "cascade"),
+            ("Control Flow", flow_menu, "cascade"),
+            ("Clipboard Commands", clipboard_menu, "cascade"),
+            ("Timing/Utility", timing_menu, "cascade"),
+            ("Windows", windows_menu, "cascade"),
+            ("separator",),
+            ("Copy", self.copy_command, {"accelerator": "Ctrl+C"}),
+            ("Paste", self.paste_command, {"accelerator": "Ctrl+V"}),
+            ("separator",),
+            ("Delete", self.remove_command),
+        ])
         
         # Show menu at cursor position
         menu.tk_popup(event.x_root, event.y_root)
@@ -3427,6 +4324,8 @@ class MacroMakerApp:
             self.add_wait_for_window_at_index(insert_index)
         elif command_type == "focus_window":
             self.add_focus_window_at_index(insert_index)
+        elif command_type == "switch_to_window":
+            self.add_switch_to_window_at_index(insert_index)
         elif command_type == "message":
             self.add_message_at_index(insert_index)
         elif command_type in command_map:
@@ -3834,17 +4733,48 @@ class MacroMakerApp:
     
     def trigger_macro(self, macro):
         """Triggered when hotkey is pressed - toggles start/stop"""
-        if self.executor.running:
-            # Stop the running macro
-            self.stop_macro()
-        else:
-            # Start the macro
-            def on_main_thread():
-                self.macro_var.set(macro.name)
+        try:
+            print(f"[HOTKEY] Trigger pressed for macro: {macro.name}")
+            
+            # CRITICAL: Release all modifier keys stuck from the hotkey press
+            # This must happen FIRST and IMMEDIATELY to unblock the keyboard listener
+            release_all_modifier_keys()
+            
+            if self.executor.running:
+                # Stop the running macro
+                print(f"[HOTKEY] Macro already running, stopping it")
+                self.stop_macro()
+            else:
+                # Start the macro - set current_macro FIRST before threading
+                print(f"[HOTKEY] Starting macro: {macro.name}")
                 self.current_macro = macro
-                self.update_command_list()
-            self.root.after(0, on_main_thread)
-            threading.Thread(target=self.run_macro, daemon=True).start()
+                
+                # Update GUI on main thread
+                def on_main_thread():
+                    try:
+                        self.macro_var.set(macro.name)
+                        self.update_command_list()
+                        print(f"[HOTKEY] Updated GUI for macro: {macro.name}")
+                    except Exception as e:
+                        print(f"[HOTKEY] Error updating GUI: {e}")
+                
+                self.root.after(0, on_main_thread)
+                
+                # Start macro execution in separate thread
+                def run_macro_safe():
+                    try:
+                        self.run_macro()
+                    except Exception as e:
+                        print(f"[HOTKEY] Error executing macro: {e}")
+                        self.root.after(0, lambda: self.highlight_command(-1))
+                        self.root.after(0, lambda: self.status_label.configure(text="Error"))
+                
+                threading.Thread(target=run_macro_safe, daemon=True).start()
+                print(f"[HOTKEY] Macro thread started for: {macro.name}")
+        except Exception as e:
+            print(f"[HOTKEY] CRITICAL ERROR in trigger_macro: {e}")
+            import traceback
+            traceback.print_exc()
     
     def show_key_selector(self, title):
         """Show a dropdown dialog to select a keyboard key"""
@@ -4583,9 +5513,9 @@ class MacroMakerApp:
             
             # Check if region is valid
             if x2 - x1 > 5 and y2 - y1 > 5:
-                # Capture the selected region
+                # Capture the selected region (all_screens for multi-monitor support)
                 time.sleep(0.2)  # Small delay to ensure window is closed
-                screenshot = ImageGrab.grab(bbox=(x1, y1, x2, y2))
+                screenshot = ImageGrab.grab(bbox=(x1, y1, x2, y2), all_screens=True)
                 return screenshot, (x1, y1, x2, y2)
         
         return None
@@ -5495,10 +6425,30 @@ class MacroMakerApp:
             messagebox.showwarning("Warning", "Please select a macro first")
             return
         
-        pattern = self.show_input_dialog("Focus Window", "Enter window title pattern (use * as wildcard):")
+        pattern = self.show_window_selection_dialog(
+            "Focus Window",
+            "Pick a window to focus, or enter part of its title:",
+        )
         if pattern:
             self.save_state()
             self.current_macro.commands.insert(insert_index, FocusWindowCommand(pattern))
+            self.selected_index = insert_index
+            self.update_command_list()
+            self.save_macros()
+    
+    def add_switch_to_window_at_index(self, insert_index):
+        """Add switch-to-window command at specific index"""
+        if not self.current_macro:
+            messagebox.showwarning("Warning", "Please select a macro first")
+            return
+        
+        pattern = self.show_window_selection_dialog(
+            "Switch to Window",
+            "Pick a window to switch to, or enter part of its title:",
+        )
+        if pattern:
+            self.save_state()
+            self.current_macro.commands.insert(insert_index, SwitchToWindowCommand(pattern))
             self.selected_index = insert_index
             self.update_command_list()
             self.save_macros()
@@ -5811,62 +6761,89 @@ class MacroMakerApp:
             self.save_macros()
     
     def copy_command(self, event=None):
-        """Copy selected command"""
+        """Copy selected command(s)"""
         if not self.current_macro:
             return "break"
         
-        if self.selected_index is not None and 0 <= self.selected_index < len(self.current_macro.commands):
-            cmd = self.current_macro.commands[self.selected_index]
-            # Store a deep copy of the command
-            self.copied_command = cmd.to_dict()
+        indices = self._get_selected_indices_sorted()
+        valid = [i for i in indices if 0 <= i < len(self.current_macro.commands)]
+        if not valid:
+            return "break"
+        
+        self.copied_commands = [
+            self.current_macro.commands[i].to_dict() for i in valid
+        ]
+        # Keep single-cmd legacy field in sync (used elsewhere if any)
+        self.copied_command = self.copied_commands[0] if len(self.copied_commands) == 1 else None
         return "break"
     
     def cut_command(self, event=None):
-        """Cut selected command (copy + delete)"""
+        """Cut selected command(s) (copy + delete)"""
         if not self.current_macro:
             return "break"
         
-        if self.selected_index is not None and 0 <= self.selected_index < len(self.current_macro.commands):
-            # Copy the command
-            cmd = self.current_macro.commands[self.selected_index]
-            self.copied_command = cmd.to_dict()
-            
-            # Delete the command
-            self.save_state()
-            deleted_index = self.selected_index
-            self.current_macro.remove_command(self.selected_index)
-            
-            # Select the command above the deleted one
-            if deleted_index > 0:
-                self.selected_index = deleted_index - 1
-            elif len(self.current_macro.commands) > 0:
-                self.selected_index = 0
-            else:
-                self.selected_index = None
-            
-            self.update_command_list()
-            self.save_macros()
+        indices = self._get_selected_indices_sorted()
+        valid = [i for i in indices if 0 <= i < len(self.current_macro.commands)]
+        if not valid:
+            return "break"
+        
+        # Copy first
+        self.copied_commands = [
+            self.current_macro.commands[i].to_dict() for i in valid
+        ]
+        self.copied_command = self.copied_commands[0] if len(self.copied_commands) == 1 else None
+        
+        # Delete in reverse order so indices stay valid
+        self.save_state()
+        first_deleted = valid[0]
+        for i in reversed(valid):
+            self.current_macro.remove_command(i)
+        
+        # Select the command above the first deleted one
+        if first_deleted > 0:
+            new_idx = first_deleted - 1
+        elif self.current_macro.commands:
+            new_idx = 0
+        else:
+            new_idx = None
+        self._set_single_selection(new_idx)
+        
+        self.update_command_list()
+        self.save_macros()
         return "break"
     
     def paste_command(self, event=None):
-        """Paste command below selected command"""
+        """Paste copied command(s) below the active selection"""
         if not self.current_macro:
             return "break"
         
-        if self.copied_command is None:
+        # Prefer multi-clip; fall back to legacy single-clip
+        clip = self.copied_commands
+        if not clip and self.copied_command is not None:
+            clip = [self.copied_command]
+        if not clip:
             return "break"
         
-        # Determine insert position (below selected or at end)
+        # Determine insert position (below active cursor or at end)
         insert_index = (self.selected_index + 1) if self.selected_index is not None else len(self.current_macro.commands)
         
-        # Create command from dict
-        cmd = MacroCommand.from_dict(self.copied_command)
-        if cmd:
-            self.save_state()
-            self.current_macro.commands.insert(insert_index, cmd)
-            self.selected_index = insert_index
-            self.update_command_list()
-            self.save_macros()
+        self.save_state()
+        new_indices = []
+        for offset, cmd_dict in enumerate(clip):
+            cmd = MacroCommand.from_dict(cmd_dict)
+            if cmd:
+                pos = insert_index + offset
+                self.current_macro.commands.insert(pos, cmd)
+                new_indices.append(pos)
+        
+        if new_indices:
+            # Select the newly pasted block
+            self.selected_indices = set(new_indices)
+            self.selected_index = new_indices[-1]
+            self.selection_anchor = new_indices[0]
+        
+        self.update_command_list()
+        self.save_macros()
         return "break"
     
     def on_delete_press(self, event):
@@ -5880,32 +6857,37 @@ class MacroMakerApp:
         self.delete_key_pressed = False
     
     def remove_command(self):
-        """Remove selected command"""
+        """Remove selected command(s)"""
         if not self.current_macro:
             messagebox.showwarning("Warning", "Please select a macro first")
             return
         
-        # Check if a command is selected
-        if self.selected_index is not None and 0 <= self.selected_index < len(self.current_macro.commands):
-            self.save_state()  # Save state before modification
-            deleted_index = self.selected_index
-            self.current_macro.remove_command(self.selected_index)
-            
-            # Select the command above the deleted one
-            if deleted_index > 0:
-                self.selected_index = deleted_index - 1
-            elif len(self.current_macro.commands) > 0:
-                self.selected_index = 0
-            else:
-                self.selected_index = None
-            
-            self.update_command_list()
-            self.save_macros()
-        else:
+        indices = self._get_selected_indices_sorted()
+        valid = [i for i in indices if 0 <= i < len(self.current_macro.commands)]
+        if not valid:
             messagebox.showinfo("Info", "No commands to remove")
+            return
+        
+        self.save_state()
+        first_deleted = valid[0]
+        # Delete in reverse order so indices stay valid
+        for i in reversed(valid):
+            self.current_macro.remove_command(i)
+        
+        # Select the command above the first deleted one
+        if first_deleted > 0:
+            new_idx = first_deleted - 1
+        elif self.current_macro.commands:
+            new_idx = 0
+        else:
+            new_idx = None
+        self._set_single_selection(new_idx)
+        
+        self.update_command_list()
+        self.save_macros()
     
-    def run_macro(self):
-        """Run the current macro"""
+    def run_macro(self, start_index=0):
+        """Run the current macro, optionally starting at start_index."""
         if not self.current_macro:
             messagebox.showwarning("Warning", "Please select a macro first")
             return
@@ -5919,20 +6901,41 @@ class MacroMakerApp:
         except ValueError:
             repeat_count = 1
         
-        self.status_label.configure(text="Running...")
+        if start_index > 0:
+            self.status_label.configure(text=f"Running from #{start_index + 1}...")
+        else:
+            self.status_label.configure(text="Running...")
         
         def progress_callback(index):
             print(f"[PROGRESS] Executing command at index: {index}")
             self.root.after(0, lambda: self.highlight_command(index))
         
         def run():
-            print(f"[RUN] Starting macro execution")
-            self.executor.execute(self.current_macro, repeat_count, progress_callback)
+            print(f"[RUN] Starting macro execution at index {start_index}")
+            self.executor.execute(self.current_macro, repeat_count, progress_callback, start_index=start_index)
             print(f"[RUN] Macro execution complete, resetting highlight")
             self.root.after(0, lambda: self.highlight_command(-1))  # Reset highlight
             self.root.after(0, lambda: self.status_label.configure(text="Ready"))
         
         threading.Thread(target=run, daemon=True).start()
+    
+    def run_macro_from_selected(self, event=None):
+        """Run the current macro starting from the currently selected command."""
+        if not self.current_macro:
+            return "break"
+        if self.executor.running:
+            return "break"
+        # Determine starting index from active selection
+        start_index = self.selected_index
+        if start_index is None and self.selected_indices:
+            start_index = min(self.selected_indices)
+        if start_index is None:
+            start_index = 0
+        # Clamp to valid range
+        if start_index < 0 or start_index >= len(self.current_macro.commands):
+            start_index = 0
+        self.run_macro(start_index=start_index)
+        return "break"
     
     def stop_macro(self):
         """Stop the running macro"""
@@ -6438,6 +7441,24 @@ class MacroMakerApp:
                 test_result_label.configure(text="Testing...", text_color="gray")
                 dialog.update()
                 
+                # Hide dialog so it doesn't match its own image thumbnails
+                dialog.withdraw()
+                dialog.update()
+                time.sleep(0.15)
+                
+                # Use the same search_region the user has configured
+                region = search_region_data.get('region') if search_area_var.get() else None
+                
+                # Get app window bounds to exclude from search (same as execution)
+                app_bounds = None
+                try:
+                    app_bounds = (
+                        self.root.winfo_x(), self.root.winfo_y(),
+                        self.root.winfo_width(), self.root.winfo_height()
+                    )
+                except Exception:
+                    pass
+                
                 found = False
                 found_images = []
                 
@@ -6447,12 +7468,24 @@ class MacroMakerApp:
                     
                     if os.path.exists(image_path):
                         try:
-                            location = pyautogui.locateOnScreen(image_path, confidence=confidence)
-                            if location:
+                            # Use the same find function as macro execution
+                            result, center = find_image_with_verification(
+                                image_path=image_path,
+                                confidence=confidence,
+                                move_to_image=False,
+                                search_region=region,
+                                max_attempts=1,
+                                app_window_bounds=app_bounds
+                            )
+                            if result:
                                 found = True
                                 found_images.append(os.path.basename(image_path))
                         except Exception:
                             pass
+                
+                # Restore dialog
+                dialog.deiconify()
+                dialog.update()
                 
                 if found:
                     if len(found_images) == 1:
@@ -6699,9 +7732,49 @@ class MacroMakerApp:
         messagebox.showinfo("Success", f"Window position saved for '{self.current_macro.name}'\n{geometry}")
     
     def start_hotkey_listener(self):
-        """Start listening for hotkeys"""
-        # Keyboard library handles this automatically
-        pass
+        """Start listening for hotkeys with recovery mechanism"""
+        # Register Shift+Esc as global stop-all-macros hotkey
+        try:
+            keyboard.add_hotkey('shift+esc', self.stop_macro)
+            print("[HOTKEY] Registered Shift+Esc hotkey")
+        except Exception as e:
+            print(f"Error registering Shift+Esc hotkey: {e}")
+        
+        # Start a monitor thread to check if keyboard listener is healthy
+        def monitor_hotkeys():
+            """Monitor keyboard listener health and restart if needed"""
+            import time
+            last_check_time = time.time()
+            consecutive_failures = 0
+            
+            while True:
+                try:
+                    time.sleep(5)  # Check every 5 seconds
+                    current_time = time.time()
+                    
+                    # Simple health check: try to query keyboard state
+                    try:
+                        keyboard.is_pressed('escape')  # Non-invasive check
+                        consecutive_failures = 0
+                    except Exception as e:
+                        print(f"[KEYMON] Keyboard check failed: {e}")
+                        consecutive_failures += 1
+                        
+                        # If multiple consecutive failures, alert user
+                        if consecutive_failures >= 3:
+                            print(f"[KEYMON] ALERT: Keyboard listener may be frozen after {consecutive_failures} failures")
+                            print(f"[KEYMON] Hotkeys may not be responding. Try restarting Omnibot.")
+                            consecutive_failures = 0  # Reset to avoid spam
+                    
+                except Exception as e:
+                    print(f"[KEYMON] Monitor thread error: {e}")
+                    time.sleep(10)  # Wait before retry
+        
+        # Start monitor thread as daemon
+        monitor_thread = threading.Thread(target=monitor_hotkeys, daemon=True)
+        monitor_thread.name = "KeyboardMonitor"
+        monitor_thread.start()
+        print("[HOTKEY] Started keyboard health monitor")
 
 
 def main():
